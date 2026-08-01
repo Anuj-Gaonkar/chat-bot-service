@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: chat-bot-service-v2-postgres
+    environment:
+      POSTGRES_DB: chatbot
+      POSTGRES_USER: chatbot
+      POSTGRES_PASSWORD: chatbot
+    ports:
+      - "5434:5432"
+    volumes:
+      - chat-bot-service-v2-postgres-data:/var/lib/postgresql/data
+
+volumes:
+  chat-bot-service-v2-postgres-data:
