@@ -3,6 +3,7 @@ package in.bank.hdfc.chat_bot_service.graph;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -17,5 +18,11 @@ public class GraphController {
 	@Operation(summary = "Get the AMB shortfall flow's node/transition graph")
 	public WorkflowGraphResponse getGraph() {
 		return graphService.getGraph();
+	}
+
+	@GetMapping(value = "/api/graph/ascii", produces = MediaType.TEXT_PLAIN_VALUE)
+	@Operation(summary = "Get the AMB shortfall flow's node/transition graph as a plain-text ASCII tree")
+	public String getGraphAscii() {
+		return graphService.getAsciiDiagram();
 	}
 }
