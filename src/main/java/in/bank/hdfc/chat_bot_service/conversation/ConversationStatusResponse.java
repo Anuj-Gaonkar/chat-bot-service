@@ -8,6 +8,6 @@ import java.util.Map;
  * driving a turn. Unlike {@link ConversationResponse} this carries no rendered steps - the
  * engine only renders steps as a side effect of {@code start()}/{@code reply()}. */
 public record ConversationStatusResponse(String sessionId, SessionStatus status, String customerId,
-		String currentNodeCode, Map<String, Object> context, Instant startedAt, Instant lastInteractionAt,
+		Long currentNodeId, Map<String, Object> context, Instant startedAt, Instant lastInteractionAt,
 		Instant endedAt) {
 }

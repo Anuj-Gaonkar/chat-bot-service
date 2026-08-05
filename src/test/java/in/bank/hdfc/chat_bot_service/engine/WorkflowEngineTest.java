@@ -24,20 +24,19 @@ class WorkflowEngineTest {
 
 	@Test
 	void topUpSuccessPath() {
-		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-TOPUP-OK", Map.of(
-				"customer_name", "Anuj", "amb_required", "10000", "shortfall_amount", "4500"));
+		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-TOPUP-OK", Map.of());
 		assertEquals("AMB_MENU", started.currentNodeCode());
 		assertEquals(SessionStatus.ACTIVE, started.status());
 		assertEquals(3, started.options().size());
 
+		// picking the top-up option no longer pauses on a fixed-amount confirmation - it goes
+		// straight through GENERATE_LINK to END_TOPUP in one turn; the customer picks their own
+		// amount on the payment page behind {{payment_link}}.
 		EngineTurnResult afterMenu = engine.reply(started.sessionId(), "OPTION_1");
-		assertEquals("CONFIRM_TOPUP", afterMenu.currentNodeCode());
+		assertEquals("END_TOPUP", afterMenu.currentNodeCode());
+		assertEquals(SessionStatus.COMPLETED, afterMenu.status());
 
-		EngineTurnResult afterConfirm = engine.reply(started.sessionId(), "YES");
-		assertEquals("END_TOPUP", afterConfirm.currentNodeCode());
-		assertEquals(SessionStatus.COMPLETED, afterConfirm.status());
-
-		boolean paymentLinkRendered = afterConfirm.steps().stream()
+		boolean paymentLinkRendered = afterMenu.steps().stream()
 				.filter(s -> "PAYMENT_LINK_SENT".equals(s.nodeCode()))
 				.anyMatch(s -> !s.message().contains("{{"));
 		assertTrue(paymentLinkRendered, "{{payment_link}} should have been substituted");
@@ -48,14 +47,12 @@ class WorkflowEngineTest {
 		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-TOPUP-FAIL",
 				Map.of("simulate_failure", true));
 
-		engine.reply(started.sessionId(), "OPTION_1");
-		EngineTurnResult afterFailedLink = engine.reply(started.sessionId(), "YES");
+		EngineTurnResult afterFailedLink = engine.reply(started.sessionId(), "OPTION_1");
 		assertEquals("AMB_MENU", afterFailedLink.currentNodeCode(), "failed link generation should loop back to AMB_MENU");
 		assertEquals(SessionStatus.ACTIVE, afterFailedLink.status());
 
 		// flag was consumed by the first failure - the retry should now succeed
-		engine.reply(started.sessionId(), "OPTION_1");
-		EngineTurnResult afterRetry = engine.reply(started.sessionId(), "YES");
+		EngineTurnResult afterRetry = engine.reply(started.sessionId(), "OPTION_1");
 		assertEquals("END_TOPUP", afterRetry.currentNodeCode());
 	}
 
@@ -109,6 +106,6 @@ class WorkflowEngineTest {
 
 		// session must still be sitting at AMB_MENU, ready to accept a real option
 		EngineTurnResult afterValidReply = engine.reply(started.sessionId(), "OPTION_1");
-		assertEquals("CONFIRM_TOPUP", afterValidReply.currentNodeCode());
+		assertEquals("END_TOPUP", afterValidReply.currentNodeCode());
 	}
 }

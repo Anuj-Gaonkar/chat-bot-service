@@ -145,18 +145,9 @@ public class GraphService {
 	}
 
 	private String messageSuffix(WorkflowNode node) {
-		String rendered = TemplateRenderer.render(node.getMessage(), DEMO_CONTEXT);
+		// No business-data placeholders left in seeded messages (payment_link/reminder_date are
+		// filled in by the engine at runtime, not diagram-time), so an empty context suffices.
+		String rendered = TemplateRenderer.render(node.getMessage(), Map.of());
 		return rendered == null || rendered.isBlank() ? "" : "  \"" + rendered + "\"";
-	}
-
-	private static final Map<String, Object> DEMO_CONTEXT = buildDemoContext();
-
-	private static Map<String, Object> buildDemoContext() {
-		Map<String, Object> context = new LinkedHashMap<>();
-		context.put("customer_name", "Anuj");
-		context.put("amb_required", 10000);
-		context.put("shortfall_amount", 4500);
-		context.put("amb_charge", 600);
-		return context;
 	}
 }

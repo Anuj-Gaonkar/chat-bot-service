@@ -1,9 +1,7 @@
 package in.bank.hdfc.chat_bot_service.conversation;
 
 import in.bank.hdfc.chat_bot_service.engine.WorkflowEngine;
-import in.bank.hdfc.chat_bot_service.entity.WorkflowNode;
 import in.bank.hdfc.chat_bot_service.entity.WorkflowSession;
-import in.bank.hdfc.chat_bot_service.repository.WorkflowNodeRepository;
 import in.bank.hdfc.chat_bot_service.repository.WorkflowSessionRepository;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -30,7 +28,6 @@ public class ConversationController {
 
 	private final WorkflowEngine workflowEngine;
 	private final WorkflowSessionRepository workflowSessionRepository;
-	private final WorkflowNodeRepository workflowNodeRepository;
 
 	@PostMapping("/api/conversations")
 	@ResponseStatus(HttpStatus.CREATED)
@@ -52,11 +49,9 @@ public class ConversationController {
 	public ConversationStatusResponse getStatus(@PathVariable String sessionId) {
 		WorkflowSession session = workflowSessionRepository.findById(sessionId)
 				.orElseThrow(() -> new IllegalArgumentException("Unknown session " + sessionId));
-		WorkflowNode currentNode = workflowNodeRepository.findById(session.getCurrentNodeId())
-				.orElseThrow(() -> new IllegalStateException("Node " + session.getCurrentNodeId() + " not found"));
 
 		return new ConversationStatusResponse(session.getSessionId(), session.getStatus(), session.getCustomerId(),
-				currentNode.getNodeCode(), session.getContext(), session.getStartedAt(),
+				session.getCurrentNodeId(), session.getContext(), session.getStartedAt(),
 				session.getLastInteractionAt(), session.getEndedAt());
 	}
 }

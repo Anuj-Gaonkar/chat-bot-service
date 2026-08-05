@@ -91,7 +91,7 @@ public class WorkflowEngine {
 			String message = "Sorry, that wasn't one of the options. " + rendered;
 			return new EngineTurnResult(session.getSessionId(), session.getStatus(),
 					List.of(new RenderedStep(current.getNodeCode(), current.getNodeType(), message)),
-					current.getNodeCode(), toOptionViews(options));
+					current.getNodeCode(), current.getNodeId(), toOptionViews(options));
 		}
 
 		EventCode eventCode = parsed.get();
@@ -128,8 +128,10 @@ public class WorkflowEngine {
 					current = follow(current, EventCode.AUTO);
 				}
 				case ACTION -> {
+					// ACTION node "message" is an internal description of the backend call (e.g.
+					// "Calls the payment gateway..."), not customer-facing copy - don't add it to
+					// steps, just log the event and move on to the next node's message.
 					EventCode outcome = simulateAction(session, current);
-					steps.add(renderStep(current, session));
 					logEvent(session, current, outcome, null);
 					current = follow(current, outcome);
 				}
@@ -138,14 +140,14 @@ public class WorkflowEngine {
 					session.setCurrentNodeId(current.getNodeId());
 					workflowSessionRepository.save(session);
 					return new EngineTurnResult(session.getSessionId(), session.getStatus(), steps,
-							current.getNodeCode(), toOptionViews(outgoing(current.getNodeId())));
+							current.getNodeCode(), current.getNodeId(), toOptionViews(outgoing(current.getNodeId())));
 				}
 				case INPUT -> {
 					steps.add(renderStep(current, session));
 					session.setCurrentNodeId(current.getNodeId());
 					workflowSessionRepository.save(session);
 					return new EngineTurnResult(session.getSessionId(), session.getStatus(), steps,
-							current.getNodeCode(), List.of());
+							current.getNodeCode(), current.getNodeId(), List.of());
 				}
 				case END -> {
 					steps.add(renderStep(current, session));
@@ -154,7 +156,7 @@ public class WorkflowEngine {
 					session.setEndedAt(Instant.now());
 					workflowSessionRepository.save(session);
 					return new EngineTurnResult(session.getSessionId(), session.getStatus(), steps,
-							current.getNodeCode(), List.of());
+							current.getNodeCode(), current.getNodeId(), List.of());
 				}
 			}
 		}

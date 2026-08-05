@@ -9,5 +9,5 @@ import java.util.List;
  * (or terminated). Deliberately channel-agnostic - not a REST DTO.
  */
 public record EngineTurnResult(String sessionId, SessionStatus status, List<RenderedStep> steps,
-		String currentNodeCode, List<OptionView> options) {
+		String currentNodeCode, Long currentNodeId, List<OptionView> options) {
 }

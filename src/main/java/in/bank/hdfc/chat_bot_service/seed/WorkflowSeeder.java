@@ -72,24 +72,22 @@ public class WorkflowSeeder implements ApplicationRunner {
 		nodes.add(node(versionId, 100L, "START", NodeType.START, "Start",
 				"System entry - triggered by the AMB-shortfall batch job", false, false, true));
 		nodes.add(node(versionId, 110L, "WELCOME", NodeType.MESSAGE, "Welcome",
-				"Hi {{customer_name}}, this is HDFC Bank on WhatsApp.", false, false, true));
+				"Hi there, this is HDFC Bank on WhatsApp.", false, false, true));
 		nodes.add(node(versionId, 120L, "AGENDA", NodeType.MESSAGE, "Agenda",
-				"Your AMB this quarter is below the required Rs.{{amb_required}}. Let's sort this out - under a minute.",
+				"Your Average Monthly Balance (AMB) this quarter is below the required minimum. Let's sort this out - under a minute.",
 				false, false, true));
 		nodes.add(node(versionId, 130L, "AMB_MENU", NodeType.QUESTION, "AMB menu",
 				"What would you like to do?", true, true, true));
-		nodes.add(node(versionId, 140L, "CONFIRM_TOPUP", NodeType.QUESTION, "Confirm top-up",
-				"Transfer Rs.{{shortfall_amount}} now to meet your AMB requirement?", true, true, true));
 		nodes.add(node(versionId, 150L, "GENERATE_LINK", NodeType.ACTION, "Generate pay link",
-				"Calls the payment gateway to create a top-up link", false, false, true));
+				"Calls the payment gateway to create a deposit link", false, false, true));
 		nodes.add(node(versionId, 160L, "PAYMENT_LINK_SENT", NodeType.MESSAGE, "Payment link sent",
-				"Tap below to complete your Rs.{{shortfall_amount}} transfer: {{payment_link}}",
+				"Tap below to add money to your account - you choose the amount: {{payment_link}}",
 				false, false, true));
 		nodes.add(node(versionId, 170L, "LINK_FAILED", NodeType.MESSAGE, "Link failed",
 				"Something went wrong generating your payment link. Please try again from the HDFC app.",
 				false, true, true));
 		nodes.add(node(versionId, 180L, "END_TOPUP", NodeType.END, "Done",
-				"Thanks! Once it reflects, your AMB requirement is met.", false, false, false));
+				"Thanks! We'll update your account once the transfer reflects.", false, false, false));
 		nodes.add(node(versionId, 190L, "REMIND_WHEN", NodeType.QUESTION, "Reminder timing",
 				"When should we remind you?", true, true, true));
 		nodes.add(node(versionId, 200L, "SET_REMINDER", NodeType.ACTION, "Schedule reminder",
@@ -99,7 +97,7 @@ public class WorkflowSeeder implements ApplicationRunner {
 		nodes.add(node(versionId, 220L, "END_REMINDER", NodeType.END, "Done",
 				"No problem, talk soon!", false, false, false));
 		nodes.add(node(versionId, 230L, "AMB_CHARGES_INFO", NodeType.MESSAGE, "Charges info",
-				"If AMB isn't maintained, a non-maintenance charge of Rs.{{amb_charge}} applies each quarter.",
+				"If AMB isn't maintained, a non-maintenance charge applies each quarter.",
 				false, true, true));
 		nodes.add(node(versionId, 240L, "CONFIRM_OPT_OUT", NodeType.QUESTION, "Confirm opt-out",
 				"Do you want to proceed without maintaining AMB?", true, true, true));
@@ -132,11 +130,9 @@ public class WorkflowSeeder implements ApplicationRunner {
 		transitions.add(transition(100L, EventCode.AUTO, null, 110L, 1));
 		transitions.add(transition(110L, EventCode.AUTO, null, 120L, 1));
 		transitions.add(transition(120L, EventCode.AUTO, null, 130L, 1));
-		transitions.add(transition(130L, EventCode.OPTION_1, "Add Rs.4,500 now", 140L, 1));
+		transitions.add(transition(130L, EventCode.OPTION_1, "Deposit money now", 150L, 1));
 		transitions.add(transition(130L, EventCode.OPTION_2, "Remind me later", 190L, 2));
 		transitions.add(transition(130L, EventCode.OPTION_3, "Don't maintain AMB", 230L, 3));
-		transitions.add(transition(140L, EventCode.YES, null, 150L, 1));
-		transitions.add(transition(140L, EventCode.NO, null, 130L, 2));
 		transitions.add(transition(150L, EventCode.SUCCESS, null, 160L, 1));
 		transitions.add(transition(150L, EventCode.FAILURE, null, 170L, 2));
 		transitions.add(transition(160L, EventCode.AUTO, null, 180L, 1));
@@ -147,8 +143,8 @@ public class WorkflowSeeder implements ApplicationRunner {
 		transitions.add(transition(200L, EventCode.FAILURE, null, 130L, 2));
 		transitions.add(transition(210L, EventCode.AUTO, null, 220L, 1));
 		transitions.add(transition(230L, EventCode.AUTO, null, 240L, 1));
-		transitions.add(transition(240L, EventCode.YES, null, 250L, 1));
-		transitions.add(transition(240L, EventCode.NO, null, 130L, 2));
+		transitions.add(transition(240L, EventCode.YES, "Yes", 250L, 1));
+		transitions.add(transition(240L, EventCode.NO, "No", 130L, 2));
 		transitions.add(transition(250L, EventCode.SUCCESS, null, 260L, 1));
 		transitions.add(transition(250L, EventCode.FAILURE, null, 130L, 2));
 		transitions.add(transition(260L, EventCode.AUTO, null, 270L, 1));
@@ -169,7 +165,7 @@ public class WorkflowSeeder implements ApplicationRunner {
 	private void seedActionConfigs() {
 		List<WorkflowActionConfig> configs = new ArrayList<>();
 		configs.add(actionConfig(150L, "/payments/links",
-				"{amount: shortfall_amount, customer_id}", "{payment_link: $.link}"));
+				"{customer_id}", "{payment_link: $.link}"));
 		configs.add(actionConfig(200L, "/crm/reminders",
 				"{customer_id, remind_on: reminder_date}", "{reminder_id: $.id}"));
 		configs.add(actionConfig(250L, "/crm/preferences",

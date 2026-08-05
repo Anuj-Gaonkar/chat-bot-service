@@ -61,9 +61,11 @@ The full return value of one `start()`/`reply()` call. Two fields are worth paus
 The class-level Javadoc explicitly calls this "deliberately channel-agnostic — not a REST DTO."
 That's a real constraint, not a stylistic note: nothing in this record knows about HTTP status
 codes, JSON field naming conventions, or WhatsApp message formats. When the conversation REST API
-was added on top of this engine, it introduced its own `ConversationResponse`/`StepResponse`/
-`OptionResponse` records in the `conversation` package specifically so this record could keep
-evolving independently of whatever shape a specific channel's contract needs.
+was added on top of this engine, it introduced its own `ConversationResponse`/`OptionResponse`
+records in the `conversation` package specifically so this record could keep evolving
+independently of whatever shape a specific channel's contract needs — e.g. `ConversationResponse`
+collapses `steps` into a single newline-joined `message` string for a single-bubble channel like
+WhatsApp, without `EngineTurnResult` itself losing per-node granularity.
 
 ---
 
