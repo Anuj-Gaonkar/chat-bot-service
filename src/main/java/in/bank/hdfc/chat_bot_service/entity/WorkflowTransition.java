@@ -41,6 +41,12 @@ public class WorkflowTransition {
 	@Column(name = "event_code", nullable = false, length = 20)
 	private EventCode eventCode;
 
+	// 1-based position among an OPTION transition's siblings from the same from_node_id - null
+	// for AUTO/YES/NO/SUCCESS/FAILURE/TIMEOUT/INVALID_INPUT, which are single-shot per node.
+	// This is what lets a QUESTION node offer any number of options (see EventCode).
+	@Column(name = "option_index")
+	private Integer optionIndex;
+
 	@Column(name = "option_label")
 	private String optionLabel;
 

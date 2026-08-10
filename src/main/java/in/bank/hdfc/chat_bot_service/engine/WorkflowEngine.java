@@ -80,9 +80,7 @@ public class WorkflowEngine {
 
 	private EngineTurnResult handleQuestionReply(WorkflowSession session, WorkflowNode current, String rawInput) {
 		List<WorkflowTransition> options = outgoing(current.getNodeId());
-		Optional<EventCode> parsed = parseEventCode(rawInput);
-		Optional<WorkflowTransition> match = parsed
-				.flatMap(ec -> options.stream().filter(t -> t.getEventCode() == ec).findFirst());
+		Optional<WorkflowTransition> match = matchReply(options, rawInput);
 
 		if (match.isEmpty()) {
 			logEvent(session, current, EventCode.INVALID_INPUT, rawInputPayload(rawInput));
@@ -94,19 +92,48 @@ public class WorkflowEngine {
 					current.getNodeCode(), current.getNodeId(), toOptionViews(options));
 		}
 
-		EventCode eventCode = parsed.get();
-		if ("REMIND_WHEN".equals(current.getNodeCode())) {
-			applyRemindWhenRule(session, eventCode);
-		}
-		logEvent(session, current, eventCode, rawInputPayload(rawInput));
-		WorkflowNode next = loadNode(match.get().getToNodeId());
+		WorkflowTransition transition = match.get();
+		applyNodeChoiceRule(session, current, transition);
+		logEvent(session, current, transition.getEventCode(), rawInputPayload(rawInput));
+		WorkflowNode next = loadNode(transition.getToNodeId());
 		return advanceAndFinalize(session, next);
 	}
 
+	/**
+	 * A QUESTION node's outgoing options are either YES/NO (matched literally, case-insensitive)
+	 * or OPTION (matched by 1-based index - the channel echoes back the plain number it was
+	 * shown, e.g. "3"). No enum ceiling on how many OPTION siblings a node can have.
+	 */
+	private Optional<WorkflowTransition> matchReply(List<WorkflowTransition> options, String rawInput) {
+		if (rawInput == null) {
+			return Optional.empty();
+		}
+		String trimmed = rawInput.trim();
+
+		if (trimmed.equalsIgnoreCase("YES") || trimmed.equalsIgnoreCase("NO")) {
+			EventCode literal = EventCode.valueOf(trimmed.toUpperCase());
+			return options.stream().filter(t -> t.getEventCode() == literal).findFirst();
+		}
+
+		try {
+			int index = Integer.parseInt(trimmed);
+			return options.stream()
+					.filter(t -> t.getEventCode() == EventCode.OPTION && index == t.getOptionIndex())
+					.findFirst();
+		} catch (NumberFormatException e) {
+			return Optional.empty();
+		}
+	}
+
 	private EngineTurnResult handleInputReply(WorkflowSession session, WorkflowNode current, String rawInput) {
-		// Stub only - contract calls for a validation loop but no INPUT node exists in the
-		// seed flow to exercise it (build context doc section 3). Always accepts and advances.
 		session.getContext().put(current.getNodeCode(), rawInput);
+		switch (current.getNodeCode()) {
+			case "CUSTOM_DATE_INPUT" -> session.getContext().put("reminder_date", rawInput);
+			case "CHURN_REASON_OTHER" -> session.getContext().put("reason", rawInput);
+			default -> {
+				// no downstream action reads this node's free text under a specific key
+			}
+		}
 		logEvent(session, current, EventCode.AUTO, rawInputPayload(rawInput));
 		WorkflowNode next = follow(current, EventCode.AUTO);
 		return advanceAndFinalize(session, next);
@@ -168,14 +195,38 @@ public class WorkflowEngine {
 	}
 
 	/**
-	 * Node-code-keyed business rule, not a generic rule engine (build context doc section 6).
-	 * OPTION_1 ("In 3 days") -> today + 3 days; OPTION_2 ("Next week") -> today + 7 days.
+	 * Node-code-keyed business rules, not a generic rule engine (build context doc section 6).
+	 * Only nodes whose chosen option feeds a downstream ACTION's request need a rule here.
 	 */
-	private void applyRemindWhenRule(WorkflowSession session, EventCode chosenOption) {
-		LocalDate reminderDate = switch (chosenOption) {
-			case OPTION_1 -> LocalDate.now(ZoneOffset.UTC).plusDays(3);
-			case OPTION_2 -> LocalDate.now(ZoneOffset.UTC).plusDays(7);
-			default -> throw new IllegalStateException("Unexpected REMIND_WHEN option " + chosenOption);
+	private void applyNodeChoiceRule(WorkflowSession session, WorkflowNode node, WorkflowTransition transition) {
+		switch (node.getNodeCode()) {
+			case "FUNDS_TIMING" -> applyFundsTimingRule(session, transition.getOptionIndex());
+			case "CASH_FLOW_MENU" -> session.getContext().put("assistance_type", transition.getOptionLabel());
+			case "CHURN_REASON_MENU" -> {
+				// index 5 ("Other, please specify") has no fixed label to record yet - the
+				// CHURN_REASON_OTHER INPUT node fills in "reason" once the customer types it.
+				if (transition.getOptionIndex() != null && transition.getOptionIndex() <= 4) {
+					session.getContext().put("reason", transition.getOptionLabel());
+				}
+			}
+			default -> {
+				// no business rule for this node's choice
+			}
+		}
+	}
+
+	/**
+	 * FUNDS_TIMING options 1-3 ("Within 3/7/15 days") -> a fixed offset from today.
+	 */
+	private void applyFundsTimingRule(WorkflowSession session, Integer optionIndex) {
+		if (optionIndex == null) {
+			return;
+		}
+		LocalDate reminderDate = switch (optionIndex) {
+			case 1 -> LocalDate.now(ZoneOffset.UTC).plusDays(3);
+			case 2 -> LocalDate.now(ZoneOffset.UTC).plusDays(7);
+			case 3 -> LocalDate.now(ZoneOffset.UTC).plusDays(15);
+			default -> throw new IllegalStateException("Unexpected FUNDS_TIMING option " + optionIndex);
 		};
 		session.getContext().put("reminder_date", reminderDate.toString());
 	}
@@ -196,25 +247,17 @@ public class WorkflowEngine {
 		}
 
 		switch (node.getNodeCode()) {
-			case "GENERATE_LINK" ->
-					context.put("payment_link", "https://pay.hdfcbank.example/topup/" + session.getSessionId());
-			case "SET_REMINDER" -> context.put("reminder_id", "RMD-" + session.getSessionId());
+			case "GENERATE_FUND_LINK" -> context.put("payment_link",
+					"https://pay.hdfcbank.example/fund/" + session.getSessionId());
+			case "SCHEDULE_FUNDS_REMINDER" -> context.put("reminder_id", "RMD-" + session.getSessionId());
+			case "ROUTE_TO_EXECUTIVE" -> context.put("executive_handoff_id", "EXE-" + session.getSessionId());
+			case "CONVERT_SALARY_ACCOUNT" -> context.put("salary_conversion_id", "SAL-" + session.getSessionId());
+			case "LOG_CALLBACK_REQUEST" -> context.put("callback_request_id", "CB-" + session.getSessionId());
 			default -> {
-				// no context side-effect needed (e.g. RECORD_OPT_OUT)
+				// no context side-effect needed (e.g. CHECK_FUNDING_STATUS)
 			}
 		}
 		return config.getOnSuccessEvent();
-	}
-
-	private Optional<EventCode> parseEventCode(String rawInput) {
-		if (rawInput == null) {
-			return Optional.empty();
-		}
-		try {
-			return Optional.of(EventCode.valueOf(rawInput.trim().toUpperCase()));
-		} catch (IllegalArgumentException e) {
-			return Optional.empty();
-		}
 	}
 
 	private Map<String, Object> rawInputPayload(String rawInput) {
@@ -224,7 +267,9 @@ public class WorkflowEngine {
 	}
 
 	private List<OptionView> toOptionViews(List<WorkflowTransition> transitions) {
-		return transitions.stream().map(t -> new OptionView(t.getEventCode(), t.getOptionLabel())).toList();
+		return transitions.stream()
+				.map(t -> new OptionView(t.getEventCode(), t.getOptionIndex(), t.getOptionLabel()))
+				.toList();
 	}
 
 	private void logEvent(WorkflowSession session, WorkflowNode node, EventCode eventCode, Map<String, Object> payload) {

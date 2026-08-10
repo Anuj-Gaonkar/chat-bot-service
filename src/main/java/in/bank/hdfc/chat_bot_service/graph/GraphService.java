@@ -125,6 +125,7 @@ public class GraphService {
 			WorkflowNode target = nodeById.get(transition.getToNodeId());
 
 			String label = transition.getEventCode()
+					+ (transition.getOptionIndex() != null ? "_" + transition.getOptionIndex() : "")
 					+ (transition.getOptionLabel() != null ? " \"" + transition.getOptionLabel() + "\"" : "");
 
 			boolean firstVisit = printed.add(target.getNodeId());

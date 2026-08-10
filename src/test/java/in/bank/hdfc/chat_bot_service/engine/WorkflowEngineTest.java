@@ -1,9 +1,11 @@
 package in.bank.hdfc.chat_bot_service.engine;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import in.bank.hdfc.chat_bot_service.entity.SessionStatus;
+import in.bank.hdfc.chat_bot_service.repository.WorkflowSessionRepository;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
 import java.util.Map;
@@ -12,9 +14,10 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 
 /**
- * Exercises {@link WorkflowEngine} against the seeded AMB shortfall flow. Runs against the same
- * compose Postgres as the dev app (seeder is idempotent, so pre-existing seed data is reused) -
- * no Testcontainers dependency added for this POC.
+ * Exercises {@link WorkflowEngine} against the seeded AMB shortfall flow - the 5-branch journey
+ * from the poster, on the generic OPTION + option_index model. Runs against the same compose
+ * Postgres as the dev app (seeder is idempotent, so pre-existing seed data is reused) - no
+ * Testcontainers dependency added for this POC.
  */
 @SpringBootTest
 class WorkflowEngineTest {
@@ -22,77 +25,214 @@ class WorkflowEngineTest {
 	@Autowired
 	private WorkflowEngine engine;
 
+	@Autowired
+	private WorkflowSessionRepository workflowSessionRepository;
+
 	@Test
-	void topUpSuccessPath() {
-		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-TOPUP-OK", Map.of());
+	void menuOffersAllFiveBranches() {
+		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-MENU", Map.of());
 		assertEquals("AMB_MENU", started.currentNodeCode());
 		assertEquals(SessionStatus.ACTIVE, started.status());
-		assertEquals(3, started.options().size());
-
-		// picking the top-up option no longer pauses on a fixed-amount confirmation - it goes
-		// straight through GENERATE_LINK to END_TOPUP in one turn; the customer picks their own
-		// amount on the payment page behind {{payment_link}}.
-		EngineTurnResult afterMenu = engine.reply(started.sessionId(), "OPTION_1");
-		assertEquals("END_TOPUP", afterMenu.currentNodeCode());
-		assertEquals(SessionStatus.COMPLETED, afterMenu.status());
-
-		boolean paymentLinkRendered = afterMenu.steps().stream()
-				.filter(s -> "PAYMENT_LINK_SENT".equals(s.nodeCode()))
-				.anyMatch(s -> !s.message().contains("{{"));
-		assertTrue(paymentLinkRendered, "{{payment_link}} should have been substituted");
+		assertEquals(5, started.options().size());
 	}
 
 	@Test
-	void topUpFailureLoopsBackToMenuAndClearsFlagAfterOneUse() {
-		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-TOPUP-FAIL",
+	void fundNowGeneratesLinkAndEndsTheTurn() {
+		// FUND_TODAY_ACK is a terminal END node reached via the GENERATE_FUND_LINK action - the
+		// engine has no real async wait, so there's no live "funded/not funded" branch here.
+		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-FUND-OK", Map.of());
+
+		EngineTurnResult afterMenu = engine.reply(started.sessionId(), "1");
+		assertEquals("FUND_TODAY_ACK", afterMenu.currentNodeCode());
+		assertEquals(SessionStatus.COMPLETED, afterMenu.status());
+		assertEquals(1, afterMenu.steps().size(),
+				"only the ack should render - GENERATE_FUND_LINK is an ACTION node, its internal description must not appear");
+		assertTrue(afterMenu.steps().get(0).message().contains("https://"),
+				"the ack message should have the generated payment_link substituted in");
+
+		String paymentLink = (String) workflowSessionRepository.findById(started.sessionId())
+				.orElseThrow().getContext().get("payment_link");
+		assertNotNull(paymentLink);
+	}
+
+	@Test
+	void fundNowSimulatedFailureLoopsBackToMenuAndClearsFlagAfterOneUse() {
+		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-FUND-FAIL",
 				Map.of("simulate_failure", true));
 
-		EngineTurnResult afterFailedLink = engine.reply(started.sessionId(), "OPTION_1");
-		assertEquals("AMB_MENU", afterFailedLink.currentNodeCode(), "failed link generation should loop back to AMB_MENU");
+		EngineTurnResult afterFailedLink = engine.reply(started.sessionId(), "1");
+		assertEquals("AMB_MENU", afterFailedLink.currentNodeCode(),
+				"a failed link generation should loop back to AMB_MENU");
 		assertEquals(SessionStatus.ACTIVE, afterFailedLink.status());
 
-		// flag was consumed by the first failure - the retry should now succeed
-		EngineTurnResult afterRetry = engine.reply(started.sessionId(), "OPTION_1");
-		assertEquals("END_TOPUP", afterRetry.currentNodeCode());
+		// flag was consumed by the first failure - retrying should now succeed
+		EngineTurnResult afterRetry = engine.reply(started.sessionId(), "1");
+		assertEquals("FUND_TODAY_ACK", afterRetry.currentNodeCode());
+		assertEquals(SessionStatus.COMPLETED, afterRetry.status());
 	}
 
 	@Test
-	void remindMeOption1IsThreeDaysOut() {
+	void fundsShortlyAckDoesNotRepeatFundsTimingsQuestion() {
+		// FUNDS_SHORTLY_ACK's message used to end with the exact same sentence FUNDS_TIMING
+		// asks next, and both get joined into one bubble - so the question rendered twice.
+		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-NO-DUPE", Map.of());
+		EngineTurnResult afterMenu = engine.reply(started.sessionId(), "2");
+
+		long occurrences = afterMenu.steps().stream()
+				.filter(s -> s.message() != null && s.message().contains("When do you expect the funds?"))
+				.count();
+		assertEquals(1, occurrences, "the question should render exactly once, not once per node");
+	}
+
+	@Test
+	void fundsShortlyThreeDaysOptionSetsReminderDate() {
 		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-REMIND-3D", Map.of());
-		engine.reply(started.sessionId(), "OPTION_2");
-		EngineTurnResult afterChoice = engine.reply(started.sessionId(), "OPTION_1");
+		engine.reply(started.sessionId(), "2");
+		EngineTurnResult afterChoice = engine.reply(started.sessionId(), "1");
 
-		assertEquals("END_REMINDER", afterChoice.currentNodeCode());
+		assertEquals("END_FUNDS_REMINDER", afterChoice.currentNodeCode());
+		// END_FUNDS_REMINDER's message (poster-faithful) doesn't echo the date back to the
+		// customer - verify the computed value landed in session context instead.
 		String expectedDate = LocalDate.now(ZoneOffset.UTC).plusDays(3).toString();
-		boolean reminderDateRendered = afterChoice.steps().stream()
-				.filter(s -> "REMINDER_SET".equals(s.nodeCode()))
-				.anyMatch(s -> s.message().contains(expectedDate));
-		assertTrue(reminderDateRendered, "reminder_date should be today + 3 days for OPTION_1");
+		assertEquals(expectedDate, reminderDate(started.sessionId()));
 	}
 
 	@Test
-	void remindMeOption2IsSevenDaysOut() {
-		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-REMIND-7D", Map.of());
-		engine.reply(started.sessionId(), "OPTION_2");
-		EngineTurnResult afterChoice = engine.reply(started.sessionId(), "OPTION_2");
+	void fundsShortlyFifteenDaysOptionSetsReminderDate() {
+		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-REMIND-15D", Map.of());
+		engine.reply(started.sessionId(), "2");
+		EngineTurnResult afterChoice = engine.reply(started.sessionId(), "3");
 
-		assertEquals("END_REMINDER", afterChoice.currentNodeCode());
+		assertEquals("END_FUNDS_REMINDER", afterChoice.currentNodeCode());
+		String expectedDate = LocalDate.now(ZoneOffset.UTC).plusDays(15).toString();
+		assertEquals(expectedDate, reminderDate(started.sessionId()));
+	}
+
+	private String reminderDate(String sessionId) {
+		return (String) workflowSessionRepository.findById(sessionId).orElseThrow().getContext().get("reminder_date");
+	}
+
+	@Test
+	void fundsShortlyFailureLoopsBackToMenuAndClearsFlagAfterOneUse() {
+		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-REMIND-FAIL",
+				Map.of("simulate_failure", true));
+		engine.reply(started.sessionId(), "2");
+		EngineTurnResult afterFailedSchedule = engine.reply(started.sessionId(), "1");
+		assertEquals("AMB_MENU", afterFailedSchedule.currentNodeCode(),
+				"failed reminder scheduling should loop back to AMB_MENU");
+		assertEquals(SessionStatus.ACTIVE, afterFailedSchedule.status());
+
+		// flag was consumed by the first failure - retrying the whole branch should now succeed
+		engine.reply(started.sessionId(), "2");
+		EngineTurnResult afterRetry = engine.reply(started.sessionId(), "1");
+		assertEquals("END_FUNDS_REMINDER", afterRetry.currentNodeCode());
+	}
+
+	@Test
+	void cashFlowSpeakToExecutiveReachesHandoffMessage() {
+		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-CASHFLOW-EXEC", Map.of());
+		engine.reply(started.sessionId(), "3");
+		EngineTurnResult afterChoice = engine.reply(started.sessionId(), "2"); // "Speak to an executive"
+
+		assertEquals("END_EXECUTIVE_HANDOFF", afterChoice.currentNodeCode());
+		assertEquals(SessionStatus.COMPLETED, afterChoice.status());
+	}
+
+	@Test
+	void cashFlowUnderstandChargesRedirectsWithoutAnyAction() {
+		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-CASHFLOW-CHARGES", Map.of());
+		engine.reply(started.sessionId(), "3");
+		EngineTurnResult afterChoice = engine.reply(started.sessionId(), "3"); // "Understand application charges"
+
+		assertEquals("CHARGES_INFO_REDIRECT", afterChoice.currentNodeCode());
+		assertEquals(SessionStatus.COMPLETED, afterChoice.status());
+	}
+
+	@Test
+	void cashFlowRemindMeLaterRoutesToFundsTimingLikeBranch2() {
+		// "Remind me later" (option 1) should ask "when" the same way Branch 2 does, instead of
+		// silently scheduling an undated reminder.
+		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-CASHFLOW-REMIND", Map.of());
+		engine.reply(started.sessionId(), "3");
+		EngineTurnResult afterChoice = engine.reply(started.sessionId(), "1"); // "Remind me later"
+		assertEquals("FUNDS_TIMING", afterChoice.currentNodeCode());
+
+		EngineTurnResult afterTiming = engine.reply(started.sessionId(), "2"); // "Within 7 days"
+		assertEquals("END_FUNDS_REMINDER", afterTiming.currentNodeCode());
 		String expectedDate = LocalDate.now(ZoneOffset.UTC).plusDays(7).toString();
-		boolean reminderDateRendered = afterChoice.steps().stream()
-				.filter(s -> "REMINDER_SET".equals(s.nodeCode()))
-				.anyMatch(s -> s.message().contains(expectedDate));
-		assertTrue(reminderDateRendered, "reminder_date should be today + 7 days for OPTION_2");
+		assertEquals(expectedDate, reminderDate(started.sessionId()));
 	}
 
 	@Test
-	void optOutPath() {
-		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-OPTOUT", Map.of());
-		EngineTurnResult afterMenu = engine.reply(started.sessionId(), "OPTION_3");
-		assertEquals("CONFIRM_OPT_OUT", afterMenu.currentNodeCode());
+	void unawareAmbChargesReachesWebsiteRedirect() {
+		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-UNAWARE-CHARGES", Map.of());
+		engine.reply(started.sessionId(), "4");
+		EngineTurnResult afterInfo = engine.reply(started.sessionId(), "1"); // "AMB charges"
 
-		EngineTurnResult afterConfirm = engine.reply(started.sessionId(), "YES");
-		assertEquals("END_OPT_OUT", afterConfirm.currentNodeCode());
-		assertEquals(SessionStatus.COMPLETED, afterConfirm.status());
+		assertEquals("INFO_WEBSITE_REDIRECT", afterInfo.currentNodeCode());
+		assertEquals(SessionStatus.COMPLETED, afterInfo.status());
+	}
+
+	@Test
+	void unawareUpgradeBenefitsReachesPlaceholderJourney() {
+		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-UNAWARE-UPGRADE", Map.of());
+		engine.reply(started.sessionId(), "4");
+		EngineTurnResult afterInfo = engine.reply(started.sessionId(), "3"); // "Upgrade benefits..."
+
+		assertEquals("ACCOUNT_UPGRADE_JOURNEY", afterInfo.currentNodeCode());
+		assertEquals(SessionStatus.COMPLETED, afterInfo.status());
+	}
+
+	@Test
+	void churnSalaryMovedElsewhereRoutesToSalaryAccountOffer() {
+		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-CHURN-SALARY", Map.of());
+		EngineTurnResult afterMenu = engine.reply(started.sessionId(), "5");
+		assertEquals("CHURN_REASON_MENU", afterMenu.currentNodeCode());
+		assertEquals(5, afterMenu.options().size());
+
+		EngineTurnResult afterReason = engine.reply(started.sessionId(), "1"); // "Salary moved elsewhere"
+		assertEquals("END_SALARY_ACCOUNT_OFFER", afterReason.currentNodeCode());
+		assertEquals(SessionStatus.COMPLETED, afterReason.status());
+	}
+
+	@Test
+	void churnAccountNoLongerNeededEndsWithVisitBranchMessage() {
+		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-CHURN-NO-NEED", Map.of());
+		engine.reply(started.sessionId(), "5");
+		EngineTurnResult afterReason = engine.reply(started.sessionId(), "3"); // "Account no longer needed"
+
+		assertEquals("END_VISIT_BRANCH", afterReason.currentNodeCode());
+		assertEquals(SessionStatus.COMPLETED, afterReason.status());
+	}
+
+	@Test
+	void churnServiceConcernOffersCallbackButtonThenLogsIt() {
+		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-CHURN-SERVICE", Map.of());
+		engine.reply(started.sessionId(), "5");
+		EngineTurnResult afterReason = engine.reply(started.sessionId(), "4"); // "Service concern"
+		assertEquals("SERVICE_CONCERN_CALLBACK", afterReason.currentNodeCode());
+		assertEquals(1, afterReason.options().size(), "only the callback button should be offered");
+
+		EngineTurnResult afterCallback = engine.reply(started.sessionId(), "1"); // "Request a callback"
+		assertEquals("END_CALLBACK_LOGGED", afterCallback.currentNodeCode());
+		assertEquals(SessionStatus.COMPLETED, afterCallback.status());
+	}
+
+	@Test
+	void churnOtherReasonGoesThroughInputNodeThenCallback() {
+		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-CHURN-OTHER", Map.of());
+		engine.reply(started.sessionId(), "5");
+		EngineTurnResult afterOther = engine.reply(started.sessionId(), "5"); // "Other (Please specify)"
+		assertEquals("CHURN_REASON_OTHER", afterOther.currentNodeCode());
+
+		EngineTurnResult afterFreeText = engine.reply(started.sessionId(), "Moving abroad");
+		assertEquals("OTHER_CONCERN_CALLBACK", afterFreeText.currentNodeCode());
+
+		EngineTurnResult afterCallback = engine.reply(started.sessionId(), "1"); // "Request a callback"
+		assertEquals("END_CALLBACK_LOGGED", afterCallback.currentNodeCode());
+		assertEquals(SessionStatus.COMPLETED, afterCallback.status());
+		assertEquals("Moving abroad", workflowSessionRepository.findById(started.sessionId())
+				.orElseThrow().getContext().get("reason"));
 	}
 
 	@Test
@@ -105,7 +245,18 @@ class WorkflowEngineTest {
 		assertTrue(afterBadReply.steps().get(0).message().startsWith("Sorry, that wasn't one of the options."));
 
 		// session must still be sitting at AMB_MENU, ready to accept a real option
-		EngineTurnResult afterValidReply = engine.reply(started.sessionId(), "OPTION_1");
-		assertEquals("END_TOPUP", afterValidReply.currentNodeCode());
+		EngineTurnResult afterValidReply = engine.reply(started.sessionId(), "1");
+		assertEquals("FUND_TODAY_ACK", afterValidReply.currentNodeCode());
+	}
+
+	@Test
+	void outOfRangeOptionIndexIsInvalidNotAnException() {
+		EngineTurnResult started = engine.start("AMB_SHORTFALL_Q2", "CUST-OUT-OF-RANGE", Map.of());
+
+		// AMB_MENU only has options 1-5 - "9" must be rejected like any other unmatched reply,
+		// not throw (guards against the OPTION+index model silently accepting anything numeric).
+		EngineTurnResult afterBadReply = engine.reply(started.sessionId(), "9");
+		assertEquals("AMB_MENU", afterBadReply.currentNodeCode());
+		assertEquals(SessionStatus.ACTIVE, afterBadReply.status());
 	}
 }

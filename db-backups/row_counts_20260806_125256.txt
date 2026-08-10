@@ -1,0 +1,12 @@
+           t            |  c  
+------------------------+-----
+ workflow               |   1
+ workflow_action_config |   3
+ workflow_entry_point   |   1
+ workflow_node          |  17
+ workflow_session       |  74
+ workflow_session_event | 510
+ workflow_transition    |  21
+ workflow_version       |   1
+(8 rows)
+
