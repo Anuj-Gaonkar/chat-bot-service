@@ -178,6 +178,11 @@ public class WorkflowEngine {
 				}
 				case END -> {
 					steps.add(renderStep(current, session));
+					// Unlike QUESTION/INPUT, nothing ever logs a later event for this node - it's
+					// terminal, so log the arrival itself. Without this, a session's very last
+					// message never appears in workflow_session_event, which SessionFrameService
+					// replays - every completed session's frame would be missing its ending.
+					logEvent(session, current, EventCode.AUTO, null);
 					session.setCurrentNodeId(current.getNodeId());
 					session.setStatus(SessionStatus.COMPLETED);
 					session.setEndedAt(Instant.now());
