@@ -183,6 +183,9 @@ public class WorkflowEngine {
 					// message never appears in workflow_session_event, which SessionFrameService
 					// replays - every completed session's frame would be missing its ending.
 					logEvent(session, current, EventCode.AUTO, null);
+					// Freeze this END node's conclusion tag onto the session - see
+					// WorkflowSession.conclusionCode.
+					session.setConclusionCode(current.getConclusionCode());
 					session.setCurrentNodeId(current.getNodeId());
 					session.setStatus(SessionStatus.COMPLETED);
 					session.setEndedAt(Instant.now());

@@ -43,6 +43,13 @@ public class WorkflowNode {
 	@Column(name = "message", columnDefinition = "text")
 	private String message;
 
+	// Set only on END-type nodes - a static tag declaring what business outcome landing here
+	// represents (e.g. "FUNDED", "ESCALATED_TO_EXECUTIVE"). Null for every non-END node. Copied
+	// onto WorkflowSession.conclusionCode the moment a session reaches this node - see
+	// WorkflowEngine's END case.
+	@Column(name = "conclusion_code", length = 50)
+	private String conclusionCode;
+
 	@Column(name = "back_allowed", nullable = false)
 	private boolean backAllowed;
 

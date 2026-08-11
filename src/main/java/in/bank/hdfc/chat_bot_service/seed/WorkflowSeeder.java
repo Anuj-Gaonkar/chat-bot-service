@@ -19,6 +19,7 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import lombok.RequiredArgsConstructor;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
@@ -188,7 +189,31 @@ public class WorkflowSeeder implements ApplicationRunner {
 				"Thank you, we've logged your request. Someone will call you back shortly.",
 				false, false, false));
 
+		tagConclusions(nodes);
 		workflowNodeRepository.saveAll(nodes);
+	}
+
+	/**
+	 * Tags every END node with a business-outcome taxonomy code, later frozen onto
+	 * {@code WorkflowSession.conclusionCode} by {@link in.bank.hdfc.chat_bot_service.engine.WorkflowEngine}
+	 * when a session reaches it - see the session-conclusions migration for the full design note.
+	 * Non-END nodes are left untagged (null).
+	 */
+	private void tagConclusions(List<WorkflowNode> nodes) {
+		Map<Long, String> conclusions = Map.ofEntries(
+				Map.entry(205L, "FUND_LINK_SENT"),
+				Map.entry(220L, "FUNDED"),
+				Map.entry(230L, "FUND_PENDING"),
+				Map.entry(350L, "REMINDER_SET"),
+				Map.entry(425L, "INFO_REDIRECT"),
+				Map.entry(430L, "ESCALATED_TO_EXECUTIVE"),
+				Map.entry(515L, "INFO_REDIRECT"),
+				Map.entry(520L, "UPGRADE_INTEREST"),
+				Map.entry(631L, "SALARY_ACCOUNT_OFFERED"),
+				Map.entry(632L, "RETENTION_APPEAL"),
+				Map.entry(634L, "VISIT_BRANCH"),
+				Map.entry(639L, "CALLBACK_REQUESTED"));
+		nodes.forEach(n -> n.setConclusionCode(conclusions.get(n.getNodeId())));
 	}
 
 	private WorkflowNode node(Long versionId, Long nodeId, String code, NodeType type, String title,

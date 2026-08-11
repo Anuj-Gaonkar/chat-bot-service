@@ -53,6 +53,9 @@ class WorkflowEngineTest {
 		String paymentLink = (String) workflowSessionRepository.findById(started.sessionId())
 				.orElseThrow().getContext().get("payment_link");
 		assertNotNull(paymentLink);
+
+		assertEquals("FUND_LINK_SENT", workflowSessionRepository.findById(started.sessionId())
+				.orElseThrow().getConclusionCode());
 	}
 
 	@Test
@@ -216,6 +219,9 @@ class WorkflowEngineTest {
 		EngineTurnResult afterCallback = engine.reply(started.sessionId(), "1"); // "Request a callback"
 		assertEquals("END_CALLBACK_LOGGED", afterCallback.currentNodeCode());
 		assertEquals(SessionStatus.COMPLETED, afterCallback.status());
+
+		assertEquals("CALLBACK_REQUESTED", workflowSessionRepository.findById(started.sessionId())
+				.orElseThrow().getConclusionCode());
 	}
 
 	@Test

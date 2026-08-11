@@ -49,6 +49,13 @@ public class WorkflowSession {
 	@Builder.Default
 	private Map<String, Object> context = new LinkedHashMap<>();
 
+	// Null while ACTIVE. Frozen from the arrival node's WorkflowNode.conclusionCode the instant
+	// the session reaches an END node - a permanent snapshot, immune to the taxonomy being
+	// edited later. For sessions that never finish, session_outcome (see the conclusions
+	// migration) derives an outcome dynamically instead of this being populated.
+	@Column(name = "conclusion_code", length = 50)
+	private String conclusionCode;
+
 	@Column(name = "started_at", nullable = false)
 	private Instant startedAt;
 
