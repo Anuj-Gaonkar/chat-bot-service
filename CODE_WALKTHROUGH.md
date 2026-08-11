@@ -1,33 +1,46 @@
 # chat-bot-service — Code Walkthrough
 
-Written for an associate-level Java/Spring developer joining this project. It explains
-*what* every part of the code does and, more importantly, *why* it's built that way. For the
-original design spec, see `SINGLE-MODULE-CHATBOT-BUILD-CONTEXT.md` — this file explains the
-code that resulted from it.
+Written for an associate-level Java/Spring developer joining this project. It explains *what*
+every part of the code does and, more importantly, *why* it's built that way. For the domain
+model this grew out of, see `SINGLE-MODULE-CHATBOT-BUILD-CONTEXT.md` — that file now documents
+the schema/design decisions as they currently stand, not a from-scratch build spec (the project
+is long past that phase). For a method-by-method deep dive on the engine specifically, see
+`ENGINE_WALKTHROUGH.md`.
 
 ---
 
 ## 1. What this service actually does
 
-It's a **WhatsApp chatbot backend for HDFC Bank**, but scoped way down from what "chatbot"
-usually implies: there's no AI, no natural-language understanding. A customer gets a WhatsApp
-message with a link (e.g. "your account balance is below the minimum"), taps it, and lands in a
-fixed, pre-authored conversation: the bank asks pre-defined questions, offers pre-defined
-button options ("Add money now" / "Remind me later" / "Don't maintain AMB"), and the customer
-picks one. That's it — no free text is ever interpreted as intent.
+It's a **WhatsApp chatbot backend for HDFC Bank**, scoped way down from what "chatbot" usually
+implies: there's no AI, no natural-language understanding. A customer gets a WhatsApp message
+with a link (e.g. "your account balance is below the minimum"), taps it, and lands in a fixed,
+pre-authored conversation — the bank asks pre-defined questions, offers pre-defined button
+options, and the customer picks one. No free text is ever interpreted as intent (the one place
+free text is accepted, an `INPUT` node, just stores it verbatim — it's never parsed).
+
+The seeded flow (`WorkflowSeeder`) is the **AMB shortfall outreach** journey — a customer whose
+Average Monthly Balance has dropped below the required minimum is asked how they'd like to
+proceed, and the conversation branches five ways from there: fund the account now, expect funds
+shortly, temporary cash-flow constraints, wasn't aware of the requirement, or no longer actively
+uses the account. See `SINGLE-MODULE-CHATBOT-BUILD-CONTEXT.md` §5 for the exact node/transition
+tables, or hit `GET /api/graph/ascii` against a running instance for a live tree diagram.
 
 **The mental model that explains almost every design decision in this codebase:**
 
 - The **flow definition** (what nodes exist, what connects to what) is a directed graph **with
-  cycles** — think a finite state machine, not a tree. Multiple branches can lead back to the
-  same node (e.g. every "No" or failed backend call routes back to the main menu node).
+  cycles** — think a finite state machine, not a tree. Multiple branches lead back to the same
+  node (every action failure, and a couple of "remind me later" sub-choices, loop back to the
+  main menu).
 - A **session** (one customer's actual conversation) is a straight line through that graph —
   they're only ever standing at one node, moving forward one step at a time.
+- A **frame** (added later, see §8) is neither of those — it's a *replay* of a session's straight
+  line, reconstructed after the fact for support/analytics use, not something the live engine
+  produces.
 
-Once you hold that distinction in your head, the two trickiest-looking pieces of code —
-`WorkflowEngine.advanceAndFinalize()` and `GraphService.appendChildren()` — both make sense:
-one *walks a line* (a session), the other *walks a graph with cycle detection* (a diagram of
-every possible path).
+Once you hold those three apart, the trickiest-looking pieces of code — `WorkflowEngine
+.advanceAndFinalize()`, `GraphService.appendChildren()`, and `SessionFrameService.buildFrame()`
+— all make sense: one *walks a line forward, live*, one *walks a graph with cycle detection*, and
+one *replays a line that's already been walked*.
 
 ---
 
@@ -39,14 +52,17 @@ in.bank.hdfc.chat_bot_service
 ├── entity          – JPA @Entity classes = the database tables
 ├── repository       – Spring Data JPA interfaces = how we query those tables
 ├── engine          – WorkflowEngine: runs an actual conversation, turn by turn
+├── conversation      – REST layer on top of the engine: the live chat API a client drives
 ├── graph           – read-only API: view the flow's *definition* (not a live session)
-└── seed            – WorkflowSeeder: inserts the one demo flow on first startup
+├── frame           – read-only API: replay a *finished-or-in-progress* session's whole journey
+├── seed            – WorkflowSeeder: inserts the demo flow on first startup
+└── web             – GlobalExceptionHandler / ApiError: engine exceptions → HTTP status codes
 ```
 
-This is deliberately **one Spring Boot module**, not split into a `core`/`api`/`persistence`
-multi-module Maven build. At this project's size that split adds friction (config duplication,
-one module ending up packaged as an unusable "fat jar" if another module depends on it) for no
-real benefit — see section 0.3 of the build-context doc if you want the fuller argument.
+Still deliberately **one Spring Boot module**, not split into a `core`/`api`/`persistence`
+multi-module Maven build — see §0.3 of the build-context doc for the fuller argument (a module
+depended on as a library installs as an unusable "fat jar" by default; not worth it at this
+scale).
 
 ---
 
@@ -54,350 +70,295 @@ real benefit — see section 0.3 of the build-context doc if you want the fuller
 
 | File | What it's for |
 |---|---|
-| `pom.xml` | Java 21, Spring Boot 4.1.0. Key deps: `spring-boot-starter-data-jpa` (JPA/Hibernate), `spring-boot-starter-webmvc` (REST controllers), `postgresql` driver, `springdoc-openapi` (Swagger UI), `lombok` (see below). |
-| `application.yaml` | Points at Postgres on `localhost:5434` (not the default 5432 — see docker-compose below), `ddl-auto: update` (Hibernate creates/alters tables automatically from the `@Entity` classes — fine for this POC, would normally be Flyway/Liquibase migrations in a real production system), `show-sql: true` (logs every SQL statement — handy while learning the codebase, noisy in prod). |
-| `docker-compose.yml` | Spins up Postgres 16 in a container, mapped to host port **5434** (not 5432) because 5432 was already taken on the dev machine. Run `docker compose up -d` before starting the app. |
-| `ChatBotServiceApplication.java` | Standard Spring Boot bootstrap, plus one Windows-specific fix: pins the JVM's default timezone to UTC before Spring starts, because on some Windows machines the JVM reports its timezone as the legacy alias `Asia/Calcutta`, which Postgres's tzdata rejects outright, crashing every DB connection attempt. |
+| `pom.xml` | Java 21, Spring Boot 4.x. Key deps: `spring-boot-starter-data-jpa`, `spring-boot-starter-webmvc`, `postgresql` driver, `springdoc-openapi` (Swagger UI), `lombok`. |
+| `application.yaml` | Points at Postgres on `localhost:5434` (not the default 5432 — see docker-compose below), `ddl-auto: update` (Hibernate auto-adds/alters columns from the `@Entity` classes as they evolve — this is *why* a brand-new nullable column like `conclusion_code` shows up in the DB the moment the app boots, before any migration SQL runs; the migration files under `db-backups/migrations/` exist to *populate/tag* that data and keep the live dev DB in sync with the seeder's intent, not to create the column itself). |
+| `docker-compose.yml` | Spins up Postgres 16, mapped to host port **5434**. Run `docker compose up -d` before starting the app. |
+| `ChatBotServiceApplication.java` | Standard Spring Boot bootstrap, plus one Windows-specific fix: pins the JVM's default timezone to UTC before Spring starts (some Windows machines report the legacy alias `Asia/Calcutta`, which Postgres's tzdata rejects outright). |
 
 **Lombok annotations you'll see on every entity** (`@Getter`, `@Setter`, `@NoArgsConstructor`,
-`@AllArgsConstructor`, `@Builder`): these are compile-time code generators, not runtime magic.
-`@Getter`/`@Setter` write the obvious `getX()`/`setX()` methods for you. `@Builder` gives you a
-fluent way to construct an object (`WorkflowNode.builder().nodeId(100L).nodeCode("START")...build()`)
-instead of a long constructor call — you'll see this used heavily in `WorkflowSeeder`.
-`@RequiredArgsConstructor` (on services) generates a constructor that takes every `final` field
-— that's what makes constructor injection work without writing the constructor by hand.
+`@AllArgsConstructor`, `@Builder`) are compile-time code generators, not runtime magic —
+`@Builder` in particular is used heavily in `WorkflowSeeder` for fluent construction.
+`@RequiredArgsConstructor` (on services/controllers) generates a constructor over every `final`
+field, which is what makes constructor injection work without writing the constructor by hand.
+
+**A recurring gotcha worth knowing up front**: `spring-boot:run` does not hot-reload a running
+JVM's compiled classes just because you edited and recompiled source on disk. If you edit
+`WorkflowEngine.java` and curl against an already-running server, you'll see old behavior until
+you actually kill the old process and start a fresh one — check `Get-Process -Name java` (or
+`ps`/`lsof -i :8080` on Unix) before assuming a code change isn't working.
 
 ---
 
 ## 4. The domain model (`entity` package)
 
-Every entity maps 1:1 to a Postgres table. A few of them look over-engineered for a POC until
-you read the comment explaining why — that's deliberate, so read the code comments, they carry
-real design intent.
+Every entity maps 1:1 to a Postgres table.
 
-### `Workflow` → `workflow` table
-The permanent identity of a business flow (e.g. "AMB shortfall outreach"). Just an id and a
-name. Survives even if the flow gets completely redesigned.
-
-### `WorkflowVersion` → `workflow_version` table
-A **version** of a workflow: `status` is `DRAFT`/`PUBLISHED`/`ARCHIVED`. Nodes and transitions
-belong to a *version*, not directly to a `Workflow`. Why the extra layer? So editing a flow
-creates a **new** version instead of mutating the live one — a customer mid-conversation on the
-old version is never affected by an in-flight edit. `startNodeId` is a plain `Long`, not a JPA
-`@ManyToOne` relationship to `WorkflowNode` — using a real relationship here would create a
-circular dependency at insert time (the version needs a node to exist, but nodes need a version
-to exist first).
+### `Workflow` / `WorkflowVersion`
+Unchanged from the original design: `Workflow` is the permanent identity of a business flow;
+`WorkflowVersion` is a versioned snapshot (`DRAFT`/`PUBLISHED`/`ARCHIVED`) that nodes and
+transitions actually belong to, so editing a flow never affects a customer already mid-conversation
+on the old version. `startNodeId` is a plain `Long`, not a JPA relationship, to avoid a circular
+insert dependency.
 
 ### `WorkflowNode` → `workflow_node` table
-One state in the flow. The two fields worth calling out:
-- **`nodeId` is manually assigned, gapped by 10** (100, 110, 120, ...) — look at `WorkflowSeeder`
-  and you'll see every node ID is a round number. This is **not** `@GeneratedValue` on purpose:
-  it leaves room to insert a new node later (e.g. `135` between `130` and `140`) without
-  renumbering everything downstream. Compare this to `WorkflowTransition.transitionId`, which
-  *is* a plain auto-increment — transitions are never inserted "between" other transitions the
-  way nodes are, so there's no reason to gap those.
-- **`nodeType`** (`START`/`MESSAGE`/`QUESTION`/`INPUT`/`ACTION`/`END`) is the single field that
-  drives what the engine actually *does* at that node — see section 6, it's the most important
-  enum in the whole codebase.
+- **`nodeId` is manually assigned, gapped by 10** (100, 110, 120, ...) — leaves room to insert a
+  node later without renumbering. `WorkflowTransition.transitionId`, by contrast, *is* a plain
+  auto-increment, since transitions are never inserted "between" other transitions.
+- **`nodeType`** (`START`/`MESSAGE`/`QUESTION`/`INPUT`/`ACTION`/`END`) drives what the engine does
+  at that node — see §6.
+- **`conclusionCode`** (added later) — set only on `END`-type nodes, a static tag declaring the
+  business outcome landing there represents (`FUNDED`, `ESCALATED_TO_EXECUTIVE`,
+  `CALLBACK_REQUESTED`, ...). Null everywhere else. See §9.
 
-Note there's no "options" column on a node — a node's possible next steps live entirely in
-`WorkflowTransition` rows pointing at it, because a node can have any number of outgoing
-choices, which a fixed set of columns can't represent.
+No "options" column — a node's possible next steps live entirely in `WorkflowTransition` rows
+pointing at it.
 
-### `WorkflowTransition` → `workflow_transition` table (renamed from the earlier `workflow_edge`)
-One row = one possible move: `fromNodeId` → (`eventCode`) → `toNodeId`. `eventCode` is an enum
-(`AUTO`, `OPTION_1..3`, `YES`, `NO`, `SUCCESS`, `FAILURE`, `TIMEOUT`, `INVALID_INPUT`).
-`optionLabel` is only populated when the transition is a customer-visible choice (e.g. "Add
-Rs.4,500 now") — it's `null` for system-driven transitions like `AUTO`/`SUCCESS`/`FAILURE`,
-which the customer never sees as a button. `displayOrder` controls what order multiple options
-are shown in. Deliberately **one table** covering both customer choices and automatic system
-transitions — an earlier design split those into two tables and that created two
-sources-of-truth for the same underlying question ("given this node and this event, where do I
-go?").
+### `WorkflowTransition` → `workflow_transition` table
+One row = one possible move: `fromNodeId` → (`eventCode`) → `toNodeId`. `eventCode` is `AUTO` /
+**`OPTION`** / `YES` / `NO` / `SUCCESS` / `FAILURE` / `TIMEOUT` / `INVALID_INPUT` — note there is
+**no** `OPTION_1`/`OPTION_2`/`OPTION_3` in the enum. That was the original design and it capped a
+`QUESTION` node at 3 options; it was replaced with a single generic `OPTION` event code plus an
+`optionIndex` column (1-based position among a node's OPTION siblings, null for every other event
+code). A `QUESTION` node can now offer any number of options without ever touching this enum or
+its DB `CHECK` constraint again. `optionLabel` is customer-visible text (null for system
+transitions like `AUTO`/`SUCCESS`/`FAILURE`). `displayOrder` controls render order.
+
+- **`entryReasonCode`** (added later) — set only on `AMB_MENU`'s 5 outgoing options, tagging
+  which top-level path each one represents (`FUND_NOW`, `FUNDS_SHORTLY`,
+  `CASH_FLOW_CONSTRAINTS`, `UNAWARE_OF_REQUIREMENT`, `CHURN_RISK`). See §9.
 
 ### `WorkflowActionConfig` → `workflow_action_config` table
-1:1 with an `ACTION`-typed node (its primary key **is** the node's id — no separate identity
-column). Describes what backend call that node should simulate: `endpoint`, `httpMethod`,
-`requestTemplate`/`responseMapping` (not yet interpreted generically — see the engine's
-`simulateAction()`, which hardcodes behavior per `nodeCode` instead), and which `EventCode`
-fires on success vs. failure.
+1:1 with an `ACTION`-typed node. Describes what backend call that node should simulate
+(`endpoint`, `httpMethod`, `requestTemplate`/`responseMapping` — not interpreted generically, see
+`WorkflowEngine.simulateAction()`, which hardcodes behavior per `nodeCode` instead) and which
+`EventCode` fires on success vs. failure.
 
 ### `WorkflowEntryPoint` → `workflow_entry_point` table
-The bridge between a WhatsApp campaign link and a flow version: `entryCode` (e.g.
-`AMB_SHORTFALL_Q2`, the short code from the link) → which `workflowVersionId` and
-`startNodeId` to start at, valid for a date range (`validFrom`/`validTo`). Many entry points can
-point at the same published version — several campaigns can share one flow.
+`entryCode` (e.g. `AMB_SHORTFALL_Q2`) → which `workflowVersionId`/`startNodeId` to start at,
+valid for a date range. Unchanged.
 
 ### `WorkflowSession` → `workflow_session` table
-One customer's **in-progress conversation**: `sessionId`, which version they're pinned to
-(so a live edit never changes their flow mid-conversation), `currentNodeId`, `status`
-(`ACTIVE`/`COMPLETED`/`ABANDONED`/`EXPIRED`/`ERROR`), and `context` — a `Map<String, Object>`
-of captured variables (`customer_name`, `shortfall_amount`, a generated `payment_link`, etc.)
-used to fill in `{{placeholder}}` tokens in node messages.
+One customer's in-progress-or-finished conversation: `sessionId`, `workflowVersionId`,
+`customerId` (a plain string — for this demo it's whatever the caller supplies, e.g. a phone
+number; there's no customer lookup/validation), `currentNodeId`, `status`
+(`ACTIVE`/`COMPLETED`/`ABANDONED`/`EXPIRED`/`ERROR` — **only `ACTIVE` and `COMPLETED` are
+actually ever set today**; the other three exist in the enum as scaffolding for a future
+idle-session reaper that hasn't been built), and `context` — a real Postgres `jsonb` column
+(`JsonbMapConverter`, Jackson-backed) holding whatever variables the flow has accumulated
+(`payment_link`, `reminder_date`, `reason`, `entry_reason_code`, ...) used to fill
+`{{placeholder}}` tokens.
 
-`context` is stored as a real Postgres `jsonb` column, not a giant text blob (`@Lob`), via
-`JsonbMapConverter` — a small `AttributeConverter<Map<String,Object>, String>` that
-serializes/deserializes the map through Jackson's `ObjectMapper`. This is what
-`@Convert(converter = JsonbMapConverter.class)` on the field wires up.
+- **`conclusionCode`** / **`entryReasonCode`** (added later) — frozen copies from the node/
+  transition tags above, written by `WorkflowEngine` the moment a session reaches an `END` node.
+  See §9.
 
 ### `WorkflowSessionEvent` → `workflow_session_event` table
-An **append-only audit log** — one row per node visited / event fired during a session. Kept
-deliberately separate from the mutable `WorkflowSession` row, and deliberately **not** meant to
-be replayed as a customer-facing chat transcript later (it's an audit/analytics trail; if a
-"show me the whole conversation" feature is ever needed, the plan is to record the engine's own
-rendered output as it happens, in its own concept — not reconstruct it from this log).
+An **append-only audit log** — one row per node visited / event fired during a session, kept
+deliberately separate from the mutable `WorkflowSession` row. The original design note here said
+this was "not meant to be replayed as a customer-facing chat transcript" — that's still true in
+the narrow sense (`chat-ui` keeps its own in-memory transcript, it never reads this table), but
+this log **is** now replayed, for a different audience: `SessionFrameService` (§8) reconstructs a
+whole session from it for support/debugging/analytics use. One consequence worth knowing: the
+`END` case in `advanceAndFinalize()` explicitly logs an event for itself (nothing else does that
+automatically for a terminal node), specifically so a completed session's very last message shows
+up when replayed — this was a real bug found and fixed while building the frame feature.
 
 ---
 
 ## 5. Repositories (`repository` package)
 
-These are all plain `interface X extends JpaRepository<Entity, IdType>` — Spring Data JPA
-generates the implementation at runtime, you never write one. Most just get free CRUD methods
-(`findById`, `save`, etc.) for nothing. The few with extra method signatures use **Spring Data's
-derived query convention** — the method name itself is parsed into a query, no `@Query`
-annotation or SQL needed:
+Plain `interface X extends JpaRepository<Entity, IdType>`, with a handful of **Spring Data
+derived query methods** (parsed from the method name, no `@Query`/SQL needed):
 
-- `WorkflowVersionRepository.findFirstByStatus(WorkflowVersionStatus status)` → `SELECT * FROM
-  workflow_version WHERE status = ? LIMIT 1`
-- `WorkflowNodeRepository.findByWorkflowVersionIdOrderByNodeIdAsc(Long versionId)` → all nodes
-  for a version, sorted by id
-- `WorkflowTransitionRepository.findByFromNodeIdOrderByDisplayOrderAsc(Long fromNodeId)` → every
-  outgoing transition from one node, in display order (used by the engine, one node at a time)
-- `WorkflowTransitionRepository.findByFromNodeIdInOrderByFromNodeIdAscDisplayOrderAsc(Collection<Long> ids)`
-  → the same thing but for a *batch* of node ids in one query (used by `GraphService`, which
-  needs every node's transitions at once to build the full graph view — avoids one query per
-  node).
-
-If you haven't seen this convention before: `findBy` + field name (+ `In` for "field is one of
-these values") + `OrderBy` + field name + `Asc`/`Desc` — Spring parses that method name
-character by character and builds the query from it.
+- `WorkflowNodeRepository.findByWorkflowVersionIdOrderByNodeIdAsc(Long versionId)`
+- `WorkflowTransitionRepository.findByFromNodeIdOrderByDisplayOrderAsc(Long fromNodeId)` — one
+  node's outgoing transitions, in order (used by the engine, one node at a time)
+- `WorkflowTransitionRepository.findByFromNodeIdInOrderByFromNodeIdAscDisplayOrderAsc(Collection<Long>)`
+  — the batched version, for `GraphService` (every node's transitions in one query)
+- `WorkflowSessionRepository.findFirstByCustomerIdOrderByStartedAtDesc(String customerId)` — a
+  customer can have multiple sessions over time; this is "their most recent one," used by the
+  frame API's phone-number lookup
+- `WorkflowSessionEventRepository.findBySessionIdOrderByEventIdAsc(String sessionId)` — a
+  session's whole event log in exact chronological order (`event_id`, not `created_at` — two fast
+  hops could tie on timestamp precision, never on the auto-increment PK), used by
+  `SessionFrameService`
 
 ---
 
-## 6. The engine (`engine` package) — the heart of the service
+## 6. The engine (`engine` package)
 
-This is the part that actually runs a conversation. It's built to be **channel-agnostic** —
-usable from a REST controller, a console test runner, or eventually a real WhatsApp webhook,
-without changing a line of `WorkflowEngine` itself. Its public API is exactly two methods:
+Runs an actual conversation, channel-agnostic (usable from a REST controller, a console runner,
+a future WhatsApp webhook, without changing a line of `WorkflowEngine` itself). Public API is
+still exactly two methods — `start(entryCode, customerId, initialContext)` and
+`reply(sessionId, rawInput)` — see `ENGINE_WALKTHROUGH.md` for the full method-by-method
+treatment. Two behavioral notes that changed since the engine was first built:
 
-```java
-EngineTurnResult start(String entryCode, String customerId, Map<String, Object> initialContext)
-EngineTurnResult reply(String sessionId, String rawInput)
-```
-
-### The three small DTOs it returns
-
-- **`RenderedStep(nodeCode, nodeType, message)`** — one node's rendered output during a turn
-  (its message with `{{placeholders}}` already substituted).
-- **`OptionView(eventCode, optionLabel)`** — one selectable option, if the engine stopped at a
-  `QUESTION`/`INPUT` node waiting for a reply.
-- **`EngineTurnResult(sessionId, status, steps, currentNodeCode, options)`** — the full result of
-  one `start()`/`reply()` call: **every** `MESSAGE`/`ACTION` node the engine passed through
-  automatically, ending on the node where it had to stop (a question, an input prompt, or the
-  end of the flow).
-
-That "batch multiple steps into one result" part matters: a real conversation might go
-`WELCOME` → `AGENDA` → `AMB_MENU` in one `start()` call, because `WELCOME` and `AGENDA` are pure
-`MESSAGE` nodes with no user input needed — the engine doesn't stop until it hits something that
-*does* need input (a `QUESTION`) or the flow ends.
-
-### `start()` — begin a session
-
-Looks up the `WorkflowEntryPoint` by its code (e.g. `AMB_SHORTFALL_Q2`), builds a brand-new
-`WorkflowSession` row sitting at that entry point's start node, with whatever `initialContext`
-was passed in (demo values like `customer_name`, `shortfall_amount` — there's no real customer
-lookup in this POC), then hands off to `advanceAndFinalize()`.
-
-### `reply()` — the customer answered something
-
-Loads the session and its current node, then dispatches on `nodeType`:
-- `QUESTION` → `handleQuestionReply()`
-- `INPUT` → `handleInputReply()`
-- anything else → throws — you can't "reply" to a `MESSAGE`/`ACTION`/`END` node, the engine was
-  never waiting for input there in the first place.
-
-`handleQuestionReply()` is worth reading closely (`WorkflowEngine.java:81`):
-1. Load this node's outgoing transitions.
-2. Try to parse the raw customer text into an `EventCode` (`parseEventCode` — just
-   `EventCode.valueOf(rawInput.trim().toUpperCase())` wrapped in a try/catch; this is the *only*
-   place anything resembling "understanding" the reply happens, and it's exact-match only, no
-   NLU).
-3. Find a transition whose `eventCode` matches.
-4. **If nothing matches**: log an `INVALID_INPUT` event, then **re-render the same question**
-   prefixed with "Sorry, that wasn't one of the options." — and importantly, return immediately
-   without moving `currentNodeId`. The session stays exactly where it was.
-5. **If it matches**: there's one flow-specific special case — if the current node's code is
-   `REMIND_WHEN`, call `applyRemindWhenRule()` first (translates "In 3 days"/"Next week" into an
-   actual `reminder_date` written into session context). Then log the event and advance to the
-   matched transition's target node via `advanceAndFinalize()`.
-
-That `REMIND_WHEN` special case is a good example of this project's chosen scope: it's a small,
-explicitly `nodeCode`-keyed `if`, not a generic business-rule engine. The build-context doc is
-explicit that building a generic rule/template interpreter is *out of scope* — one hardcoded
-flow is all this needs right now.
-
-### `advanceAndFinalize()` — the state-machine loop (`WorkflowEngine.java:115`)
-
-This is the core loop. Given a node to arrive at, it keeps stepping forward automatically until
-it hits something that requires stopping:
-
-```java
-while (true) {
-    switch (current.getNodeType()) {
-        case START   -> // no message, just auto-follow to the real first node
-        case MESSAGE  -> // render it, log AUTO, keep going
-        case ACTION   -> // simulate the backend call, follow SUCCESS or FAILURE
-        case QUESTION -> // render it, save session, RETURN (waiting for a reply)
-        case INPUT    -> // render it, save session, RETURN (waiting for free text)
-        case END      -> // render it, mark session COMPLETED, RETURN (done)
-    }
-}
-```
-
-`START`, `MESSAGE`, and `ACTION` don't `return` — they fall through to the next iteration of the
-loop with `current` reassigned to the next node (via `follow()`). `QUESTION`, `INPUT`, and `END`
-all `return` a result, because those are the only three node types where the engine legitimately
-has to stop and wait (or finish).
-
-`follow(node, eventCode)` (`WorkflowEngine.java:252`) is the one-hop primitive underneath all of
-this: look up the node's outgoing transitions, find the one matching the given event code, load
-and return its target node. If none matches, it throws — that would mean the seed data is
-inconsistent (e.g. an `ACTION` node with no `FAILURE` transition configured), which should never
-happen with a correctly-seeded flow.
-
-### `simulateAction()` — fake backend calls (`WorkflowEngine.java:186`)
-
-There's no real payment gateway or CRM in this POC. Every `ACTION` node "succeeds" by default;
-setting `simulate_failure=true` in a session's context makes the *next* action fail exactly
-once, then that flag is consumed (removed) so a retry succeeds. This exists specifically so
-tests (and manual runs) can exercise the `FAILURE → AMB_MENU` cycle-back paths without a real
-integration. Side effects (like generating a fake `payment_link`) are hardcoded per `nodeCode`
-in a `switch` — again, not driven generically from `requestTemplate`/`responseMapping`.
-
-### `TemplateRenderer` (its own tiny class, `engine/TemplateRenderer.java`)
-
-A one-method utility: finds `{{token}}` patterns in a string via regex and replaces each with
-`context.get(token)` if present. If a key is missing from the context, the token is left
-**literal** rather than throwing or blanking it out — useful because a node's raw `message` can
-be rendered outside of a live session (e.g. by the `/api/graph` endpoints below), where
-runtime-only values like `{{payment_link}}` were never going to be available anyway.
+- **Reply matching is now generic.** A `QUESTION` node's options are matched either literally
+  (`YES`/`NO`) or by 1-based index against the `OPTION` event code's `optionIndex` (the channel
+  echoes back the plain number it was shown, e.g. `"3"`) — see `WorkflowEngine.matchReply()`.
+  There's no per-option enum value anymore, so a node can offer any number of options.
+- **`ACTION` nodes never render customer-facing text.** An `ACTION` node's `message` column is an
+  internal description of the simulated backend call (e.g. "Calls the payment gateway to create a
+  secured funding link"), not copy meant for the customer — `advanceAndFinalize()`'s `ACTION` case
+  runs the simulated call and logs the event, but does *not* add a `RenderedStep` for it. (Earlier
+  in this project's life it did, and that internal description leaked into the live chat UI — this
+  was a real bug reported and fixed.)
 
 ---
 
-## 7. The graph API (`graph` package) — viewing the flow's *definition*
+## 7. The `conversation` package — the live chat API
 
-Unlike the engine (which runs one customer's *live, linear* path), this package answers a
-different question: **"what does the whole flow look like?"** — the full graph, branches and
-cycles included. Two endpoints, both read-only, both built from the same seeded data:
+This is the REST layer on top of the engine (originally deferred as "Phase 2" in the build-context
+doc; it's fully built now). `ConversationController`:
 
-### `GET /api/graph` — JSON view
+- `POST /api/conversations` — start a session. Body: `{ entryCode, customerId, context }`.
+- `POST /api/conversations/{sessionId}/messages` — reply to the current question. Body:
+  `{ rawInput }`.
+- `GET /api/conversations/{sessionId}` — read-only snapshot, doesn't advance anything.
 
-`GraphController.getGraph()` → `GraphService.getGraph()` (`GraphService.java:33`):
-1. Find the currently `PUBLISHED` `WorkflowVersion` (this POC only ever seeds one).
-2. Load its `Workflow` and `WorkflowEntryPoint`.
-3. Load every `WorkflowNode` for that version, and every `WorkflowTransition` originating from
-   any of those nodes **in one batched query** (`findByFromNodeIdInOrderByFromNodeIdAscDisplayOrderAsc`)
-   rather than one query per node.
-4. Build a `WorkflowGraphResponse`: each node embeds its own outgoing transitions directly
-   (`NodeDto` → `List<TransitionDto>`). This "grouped" shape was a deliberate choice over either
-   (a) two separate top-level `nodes`/`transitions` arrays, which forces the API consumer to
-   cross-reference by id, or (b) a deeply-nested recursive tree, which would need special-casing
-   for nodes reached more than once (like `AMB_MENU`, reached from three different branches) and
-   gets 8+ levels deep on this flow.
+`ConversationResponse` is the public, channel-agnostic shape returned by the first two — it
+collapses `EngineTurnResult.steps()` into one newline-joined `message` string (so a channel like
+WhatsApp renders one turn as one bubble) and maps `OptionView` → `OptionResponse`. Kept as a
+separate record from the engine's own `EngineTurnResult` specifically so the engine's internal
+DTO shape stays free to change independently of what a REST client needs.
 
-### `GET /api/graph/ascii` — plain-text tree diagram
-
-This is the endpoint we added most recently, and it *does* build a recursive tree — on purpose,
-because here the goal is a human-readable diagram, not a machine-consumable API shape, so the
-downsides that ruled out a tree for the JSON endpoint don't apply.
-
-`GraphController.getGraphAscii()` → `GraphService.getAsciiDiagram()`
-(`GraphService.java` — the method added after `getGraph()`). It fetches the same
-version/workflow/entryPoint/nodes/transitions as `getGraph()`, then walks the graph starting
-from the entry point's start node, indenting one level deeper per hop:
-
-```java
-Set<Long> printed = new HashSet<>();
-printed.add(start.getNodeId());
-appendChildren(start, "", printed, nodeById, transitionsByFromNodeId, out);
-```
-
-`appendChildren()` is a classic recursive tree-printer (the same shape as the Unix `tree`
-command): for each outgoing transition of the current node, print one line prefixed with either
-`+--- ` (more siblings follow) or `\--- ` (last sibling), then — **only if this target node
-hasn't been printed before** — recurse into it with the prefix extended by `|    ` (if this
-branch wasn't the last one, so the vertical bar needs to keep going down past it) or `     `
-(blank, if it was the last branch — nothing more to connect down to).
-
-The **cycle-detection** (`printed.add(target.getNodeId())` returning `false` on a repeat) is the
-whole reason this can't be naive recursion: `AMB_MENU` (node 130) is a transition target from at
-least five different places (`CONFIRM_TOPUP` NO, `LINK_FAILED` AUTO, `SET_REMINDER` FAILURE,
-`CONFIRM_OPT_OUT` NO, `RECORD_OPT_OUT` FAILURE). Without tracking what's already been printed,
-the walk would recurse into `AMB_MENU`'s children again each time, which recurse back into it,
-forever. Instead, a repeat visit just prints `(already shown above)` on that one line and stops
-— no further recursion down that branch.
-
-Each line's format: `{EVENT_CODE}["option label"] --> {node_id} {NODE_CODE} [{NODE_TYPE}]  "{message}"`.
-Messages are passed through `TemplateRenderer` against a small hardcoded `DEMO_CONTEXT` map
-(`customer_name`, `amb_required`, `shortfall_amount`, `amb_charge`) so the diagram reads
-naturally instead of showing raw `{{customer_name}}` tokens — this mirrors the sibling
-`chatbot-webapp` project's `GraphService.getAsciiDiagram()`, which this was modeled on (adapted
-here from that project's JPA `@ManyToOne` relationships to this project's flat
-`fromNodeId`/`toNodeId` foreign-key longs).
+`GlobalExceptionHandler` (`web` package) maps the engine's plain JDK exceptions to HTTP status:
+`IllegalArgumentException` (unknown session/entry code — a lookup miss) → `404`;
+`IllegalStateException` (session isn't waiting for input, or an internal invariant violation) →
+`409`; validation failures → `400`.
 
 ---
 
-## 8. The seeder (`seed/WorkflowSeeder.java`)
+## 8. The `frame` package — replaying a whole journey
 
-Implements `ApplicationRunner`, so Spring calls its `run()` once, automatically, right after the
-application context starts up. First line: `if (workflowRepository.count() > 0) return;` — if
-any workflow already exists, do nothing. That one check is what makes it **idempotent** and
-safe to leave running on every single app startup, in every environment, forever (no separate
-"only run once" flag or migration tool needed for this POC).
+Added well after the live chat API, for a different use case: "show me exactly what this one
+customer went through, end to end" — for support/debugging, or bulk analytics later. Two
+endpoints (`SessionFrameController`):
 
-When it does run, it inserts, in order: one `Workflow`, one `PUBLISHED` `WorkflowVersion`, the
-18 `WorkflowNode` rows, the 23 `WorkflowTransition` rows, the 3 `WorkflowActionConfig` rows, and
-one `WorkflowEntryPoint` (`AMB_SHORTFALL_Q2`, valid 2026-07-01 to 2026-09-30). If you want to see
-the exact shape of the flow, section 5 of `SINGLE-MODULE-CHATBOT-BUILD-CONTEXT.md` has full
-tables for all of this, or just read the seeder's `seedNodes()`/`seedTransitions()` directly —
-they're plain, readable builder calls.
+- `GET /api/sessions/{sessionId}/frame`
+- `GET /api/customers/{customerId}/frame` — looks up the customer's most recent session first
 
-**The flow itself, in one paragraph**: `START`(100) → `WELCOME`(110) → `AGENDA`(120) →
-`AMB_MENU`(130), which branches three ways: *add money now* (→`CONFIRM_TOPUP`→`GENERATE_LINK`
-[ACTION]→`PAYMENT_LINK_SENT`→`END_TOPUP`, with "No" or a failed link generation looping back to
-130), *remind me later* (→`REMIND_WHEN`→`SET_REMINDER`[ACTION]→`REMINDER_SET`→`END_REMINDER`,
-failure loops back to 130), and *don't maintain AMB* (→`AMB_CHARGES_INFO`→`CONFIRM_OPT_OUT`→
-`RECORD_OPT_OUT`[ACTION]→`OPT_OUT_CONFIRMED`→`END_OPT_OUT`, "No" or failure loops back to 130).
-This is exactly what the `/api/graph/ascii` endpoint renders as a tree.
+`SessionFrameService.reconstructFrame()` builds a `SessionFrameResponse` by:
+1. Loading the session row (header: status, timestamps, final `context`, `conclusionCode`,
+   `entryReasonCode`).
+2. Loading its whole `workflow_session_event` log, in order.
+3. For each event, joining out to the node it happened at (to get the node's message/type) and,
+   for `QUESTION`-type nodes, the node's outgoing transitions (to know what options were on
+   screen and which one was `chosen`).
+4. Re-rendering each step's message via the same `TemplateRenderer` the live engine uses, against
+   the session's **final** `context` — not a byte-exact historical snapshot of what the customer
+   saw at that moment, but a replay against the graph as it stands *today*. (A deliberate,
+   discussed tradeoff: it needs no new capture machinery and works on every session already in
+   the DB, at the cost of possibly reflecting later edits to a node's wording if the graph changes
+   after the fact.)
+5. Computing `pathSummary` — the full breadcrumb of every option actually chosen, joined with
+   `" > "` (e.g. `"I no longer actively use this account > Service concern > Request a
+   callback"`). This is free to compute: step 3 already worked out which option was `chosen` at
+   each question, `pathSummary` just collects those labels in order. It exists specifically
+   because a session's frozen `conclusionCode`/`entryReasonCode` (§9) are coarse — several
+   different sub-paths can converge on the same node and get the same tags, and `pathSummary` is
+   how you tell them apart without a new persisted field for every possible distinction.
 
----
-
-## 9. Tests (`WorkflowEngineTest`)
-
-A `@SpringBootTest` — it boots the *real* Spring context and talks to the *real* dev Postgres
-(via the same docker-compose instance you run locally), relying on the seeder's idempotency to
-have consistent data available. No Testcontainers, no mocking of the engine's dependencies —
-this is an integration test, not a unit test. Each `@Test` drives a full path through
-`start()`/`reply()` calls and asserts on the resulting `currentNodeCode`/`status`/rendered
-`steps()`:
-
-- `topUpSuccessPath` — the whole "add money" branch end to end, checks `{{payment_link}}` really
-  got substituted with a real value.
-- `topUpFailureLoopsBackToMenuAndClearsFlagAfterOneUse` — proves the `simulate_failure` flag
-  fails exactly once, then a retry succeeds.
-- `remindMeOption1IsThreeDaysOut` / `remindMeOption2IsSevenDaysOut` — proves the `REMIND_WHEN`
-  business rule computes the right date for each option.
-- `optOutPath` — the "don't maintain AMB" branch end to end.
-- `unmatchedReplyReShowsSameQuestionWithoutAdvancing` — replies with garbage ("BANANA"), asserts
-  the session doesn't move and gets the "Sorry, that wasn't one of the options" prefix, then
-  proves a subsequent valid reply still works normally.
-
-Because it's a real integration test, **Postgres must be running** (`docker compose up -d`
-first) before `mvn test` will pass.
+Frame steps deliberately include `INVALID_INPUT` attempts (wrong-answer retries) — useful for
+spotting confusing UX moments, even though a live customer-facing transcript wouldn't show them.
+`ACTION`-node steps carry no `message` (same suppression rule as §6) but do appear in the step
+list, so the frame still explains *why* a value like `payment_link` shows up in context between
+two customer-visible steps.
 
 ---
 
-## 10. Running it locally
+## 9. Session conclusions — `conclusionCode` and `entryReasonCode`
+
+Two small, additive columns exist specifically so bulk analysis ("how many customers got
+escalated to an executive," "what % drop off at the main menu") doesn't need to re-derive an
+outcome from `current_node_id`/`status` every time:
+
+- **`conclusionCode`** — *what happened*. Tagged once per `END` node in `WorkflowSeeder` (see
+  `tagConclusions()`), copied onto `WorkflowSession.conclusionCode` by `WorkflowEngine` the
+  instant the session reaches that node. A permanent snapshot, immune to the taxonomy being
+  edited later.
+- **`entryReasonCode`** — *why they engaged*. Tagged once per `AMB_MENU` option in
+  `WorkflowSeeder` (see `tagEntryReasons()`), captured into session `context` the moment
+  `AMB_MENU` is answered (`applyNodeChoiceRule`'s `"AMB_MENU"` case), then frozen onto
+  `WorkflowSession.entryReasonCode` alongside `conclusionCode` when the session completes. This
+  exists because several different paths converge on the same `conclusionCode` — e.g. "I expect
+  funds shortly" (direct) and "cash flow constraints" → "remind me later" both end on
+  `REMINDER_SET` — and `entryReasonCode` is what tells those two apart in a `GROUP BY`.
+
+Sessions that never finish aren't tagged eagerly (no scheduled abandonment-detection job exists).
+Instead, a Postgres **view**, `session_outcome` (see `db-backups/migrations/
+2026-08-11_session_conclusions.sql`), derives an outcome dynamically for anything still `ACTIVE`:
+`COALESCE(conclusion_code, 'DROPPED_AT:' || current node's node_code)`. One query —
+`SELECT conclusion, entry_reason_code, COUNT(*) FROM session_outcome GROUP BY conclusion, entry_reason_code`
+— covers every session regardless of whether it ever finished.
+
+---
+
+## 10. The graph API (`graph` package) — viewing the flow's *definition*
+
+Unchanged in shape from the original design: `GET /api/graph` (grouped JSON — each node embeds
+its own outgoing transitions) and `GET /api/graph/ascii` (a recursive, cycle-aware plain-text
+tree, printing `(already shown above)` on a repeat visit to a node like `AMB_MENU` instead of
+recursing forever). One change: `GraphService.messageSuffix()` used to render node messages
+against a small hardcoded `DEMO_CONTEXT` map (`customer_name`, `amb_required`, etc.) so the
+diagram didn't show raw `{{token}}` placeholders — those placeholders were removed from every
+seeded message (see §11), so it now renders against `Map.of()` (empty context) instead. The only
+placeholders left in any node message are `{{payment_link}}`, which is engine-generated at
+runtime and was always going to render literal on a diagram anyway (`TemplateRenderer` leaves
+missing keys untouched rather than erroring).
+
+---
+
+## 11. The seeder (`seed/WorkflowSeeder.java`)
+
+Still `ApplicationRunner`-based and idempotent (`if (workflowRepository.count() > 0) return;`).
+The seeded flow itself has been rebuilt more than once since the original 3-branch design (add
+money now / remind me later / don't maintain AMB) — it's now the 5-branch **AMB shortfall
+outreach** journey matching the bank's actual WhatsApp script, with every placeholder that would
+have needed real customer data (`{{customer_name}}`, `{{amb_required}}`, `{{shortfall_amount}}`,
+`{{amb_charge}}`) rewritten into generic copy — this is a demo-scale service with no customer data
+lookup, so the bot never asks for or references a specific amount; where money changes hands
+(funding the account), it just sends a link and lets the customer decide the amount.
+
+Current shape, branching from `AMB_MENU` (120):
+1. **Fund now** → generates a real (simulated) payment link, sends it, ends — no live
+   funded/not-funded branch (the engine has no real async wait).
+2. **Funds shortly** → asks when (3/7/15 days), schedules a reminder.
+3. **Cash-flow constraints** → remind me later (reuses branch 2's sub-flow), speak to an
+   executive, or a generic charges redirect.
+4. **Unaware of requirement** → three informational redirects, one reserved as a placeholder for
+   a future real "account upgrade journey" sub-flow.
+5. **No longer active** → five distinct reason-specific endings; two of them ("service concern",
+   "other") offer a tappable "Request a callback" button — modeled as an ordinary single-option
+   `QUESTION` node, no new schema/engine concept needed for a "button."
+
+Two seeder helper methods worth knowing about beyond `seedNodes()`/`seedTransitions()`/
+`seedActionConfigs()`: `tagConclusions()` and `tagEntryReasons()` (§9) — both run as a pass over
+the already-built node/transition lists just before `saveAll()`, so tagging a new outcome/entry
+reason never means touching the `node(...)`/`transition(...)` builder helpers or their call
+sites.
+
+For the exact current node/transition tables, read `WorkflowSeeder.java` directly, or hit
+`GET /api/graph/ascii` against a running instance.
+
+---
+
+## 12. Tests (`WorkflowEngineTest`)
+
+Still a `@SpringBootTest` — boots the real Spring context, talks to the real dev Postgres (via
+docker-compose), relies on the seeder's idempotency. No Testcontainers, no mocking — an
+integration test. **Postgres must be running** first.
+
+19 tests as of the current graph, covering: every branch end to end, the `simulate_failure`
+retry-and-succeed pattern, the `FUNDS_TIMING` date computation, the `INVALID_INPUT` re-prompt
+path, out-of-range option handling, and — notably — a test that specifically proves two
+*different* paths (funds-shortly vs. cash-flow→remind-later) land on the *same*
+`conclusionCode` but get *different* `entryReasonCode`, directly validating §9's whole reason for
+existing.
+
+---
+
+## 13. Running it locally
 
 ```bash
 docker compose up -d                 # starts Postgres on localhost:5434
@@ -405,29 +366,36 @@ docker compose up -d                 # starts Postgres on localhost:5434
 ```
 
 Then:
-- `GET http://localhost:8080/api/graph` — JSON graph
-- `GET http://localhost:8080/api/graph/ascii` — plain-text tree diagram
-- `http://localhost:8080/swagger-ui/index.html` — Swagger UI (from springdoc-openapi)
-- `http://localhost:8080/v3/api-docs` — raw OpenAPI JSON
+- `POST http://localhost:8080/api/conversations` — start a conversation (the live chat API)
+- `GET http://localhost:8080/api/graph` / `/api/graph/ascii` — the flow's definition
+- `GET http://localhost:8080/api/sessions/{id}/frame` / `/api/customers/{id}/frame` — replay a
+  session
+- `http://localhost:8080/swagger-ui/index.html` — Swagger UI
+- `chat-ui` (sibling repo) is a Next.js test harness that drives the conversation API and the
+  frame API against a phone number — see that repo's docs for its own setup.
 
-There is currently no REST endpoint to *drive* `WorkflowEngine.start()`/`reply()` directly —
-that's "Phase 2" in the build-context doc (conversation/session endpoints), explicitly deferred
-until asked for. Today the engine is only exercised by `WorkflowEngineTest`.
+Remember the stale-JVM gotcha from §3 if you're iterating: kill the old `java` process before
+trusting a fresh `curl` against newly-compiled code.
 
 ---
 
-## 11. Deliberate scope limits — don't be surprised by these
+## 14. Deliberate scope limits — still true today
 
-Straight from the build-context doc's guardrails section — these are choices, not gaps someone
-forgot about:
-
-- No free-text NLU — a reply is either an exact `EventCode` match or it isn't.
-- No `CONDITION` node type (pure business-rule branching with no user input) — flagged as a
-  known future gap, not built speculatively.
-- `INPUT` node handling is a stub (`handleInputReply()` always accepts and advances) — the seed
-  flow has no `INPUT` node, so there was nothing to validate against yet.
+- No free-text NLU — a reply is either matched exactly (`YES`/`NO` literal, or `OPTION` +
+  numeric index) or it isn't.
+- No `CONDITION` node type (pure business-rule branching with no user input) — still a flagged,
+  not-built gap.
+- `INPUT` node handling has no real validation loop — it accepts and stores whatever free text is
+  typed (used today by `CHURN_REASON_OTHER`, the "other, please specify" reason).
 - No i18n/translation tables — English only.
-- No session timeout → `EXPIRED` logic, even though the enum value exists.
-- No generic rule/template-interpretation engine — every business rule and simulated backend
-  call is hardcoded per `nodeCode`, on purpose, for this one flow.
-- No Phase 2 conversation endpoints (see section 10 above) until explicitly requested.
+- **No session idle-timeout/abandonment job** — `ABANDONED`/`EXPIRED` exist as enum values but
+  nothing ever sets them; a genuinely in-progress session and one the customer walked away from
+  hours ago look identical in `workflow_session.status` (`ACTIVE` either way). `session_outcome`
+  (§9) works around this for reporting purposes without needing the job to exist.
+- No generic rule/template-interpretation engine — every business rule and simulated backend call
+  is hardcoded per `nodeCode`, on purpose.
+- The frame reconstruction (§8) is **not** a byte-exact historical replay — it re-renders against
+  today's node text and the session's final context. A "capture the exact rendered text at the
+  moment it happened" version was discussed and deliberately deferred; if it's ever built, it'd
+  add a rendered-text snapshot to `workflow_session_event.payload` at write time, and
+  `SessionFrameService` would prefer that over re-rendering wherever it's present.

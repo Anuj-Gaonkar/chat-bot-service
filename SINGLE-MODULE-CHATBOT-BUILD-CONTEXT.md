@@ -1,26 +1,19 @@
-# HDFC WhatsApp Chatbot — Single-Module Build Context
+# HDFC WhatsApp Chatbot — Domain Model & Design Decisions
 
-## 0. How to use this file
+## 0. What this file is now
 
-You are being handed this file inside an **already-scaffolded Spring Boot project**
-(Java 21, Spring Boot 4.x). Before writing anything:
-
-1. Read the existing `pom.xml` and directory layout first. Extend what's there — don't
-   regenerate the project or discard the scaffold.
-2. This file is self-contained. You should not need any other document to build what's
-   described here — everything you need (schema, seed data, engine behavior, API shape) is below.
-3. Build **one Spring Boot module** — engine, persistence, and REST layer together in a single
-   deployable. Do not split this into multiple Maven modules or introduce a library/wrapper
-   boundary; that was tried in a sibling project and added real friction (a Spring Boot module
-   depended on as a library installs as an unusable "fat jar" by default, config files collide
-   across modules, etc.) for no benefit at this scale. One project, package-by-responsibility.
-4. Work in **phases** — build Phase 1 completely (schema + seed data + one read-only REST
-   endpoint) and confirm it runs before starting Phase 2 (conversation/session endpoints). Phase 2
-   is described here for context, not as something to start unprompted — check in before building
-   it.
-5. If anything below is ambiguous or you have to make a judgment call, prefer asking over
-   guessing, especially for the two explicit requirements in section 2 (the `workflow_transition`
-   rename and gapped `node_id`s) — get those exactly right, they're deliberate, not incidental.
+This started as a from-scratch build spec, handed to Claude Code inside an already-scaffolded,
+empty Spring Boot project. **The build described here is done** — Phase 1 and Phase 2 (§7) are
+both live, plus features neither phase originally anticipated (session-frame replay, conclusion
+tagging — §7.3, §7.4). This file has been repurposed into what it's actually useful for now: the
+**domain model and the deliberate design decisions behind it**, kept in sync with the real schema
+rather than a historical build-order artifact. For the code that implements this, see
+`CODE_WALKTHROUGH.md` (what/why, package by package) and `ENGINE_WALKTHROUGH.md` (the engine,
+method by method). For the exact current node/transition data, read `WorkflowSeeder.java`
+directly or hit `GET /api/graph/ascii` against a running instance — this doc summarizes the
+current flow's *shape*, not an exhaustive row-by-row table, since a full duplicate table here
+would just drift out of sync with the seeder every time the flow is edited (which has happened
+more than once).
 
 ## 1. Use case
 
@@ -28,39 +21,43 @@ R&D / POC for a WhatsApp chatbot that only ever asks pre-defined questions, offe
 options, and returns pre-defined responses — **no open-ended NLU, no free-text understanding**.
 Used to reach existing bank customers over WhatsApp for feedback, product advertising, and
 retention. A customer taps a link or button in a WhatsApp message and lands in a chatbot session
-that walks them through a fixed, business-authored conversational flow.
+that walks them through a fixed, business-authored conversational flow. The one seeded flow today
+is **AMB shortfall outreach** — a customer below the required Average Monthly Balance is walked
+through funding their account, requesting a reminder, or explaining why they can't/won't, ending
+in one of ~12 distinct outcomes.
 
 **The mental model:** the flow *definition* (nodes + transitions) is a directed graph with
 cycles — not a tree, not a DAG — because branches converge back onto shared nodes (e.g. a menu)
 and can loop (retry, "no," a failed backend call). Think finite state machine: nodes are states,
-transitions are edges labeled by an event. A given *session's* actual conversation, by contrast,
-is a linear path — the customer is only ever at one node at a time; "back" is just popping
-history, not graph traversal. `node_code` is a stable, human-readable business label (not
-engine-enforced); `node_type` is a small fixed enum that drives what the engine actually does.
+transitions are edges labeled by an event. A given *session's* actual conversation is a linear
+path — the customer is only ever at one node at a time. `node_code` is a stable, human-readable
+business label (not engine-enforced); `node_type` is a small fixed enum that drives what the
+engine actually does.
 
-## 2. Domain model — target schema
+## 2. Domain model — current schema
 
-This is the schema to build **directly** — treat it as final, not as something still being
-designed. It reflects two deliberate decisions on top of an earlier version of this schema that
-used `workflow_edge` and a plain auto-increment `node_id`:
+Two decisions from the original design remain load-bearing everywhere:
 
-- **`workflow_edge` is renamed to `workflow_transition`** throughout — table name, JPA entity
-  (`WorkflowTransition`, not `WorkflowEdge`), repository, service/DTO naming, everywhere. Not
-  just the table.
-- **`workflow_node.node_id` is gapped, not a plain auto-increment.** Assign IDs manually in steps
-  of 10 (100, 110, 120, ...), not `@GeneratedValue`. This leaves room to insert a new node into an
-  existing flow later (e.g. 135 between 130 and 140) without renumbering everything after it.
-  `workflow_transition`'s own PK (`transition_id`) stays a plain auto-increment — transitions
-  aren't inserted "between" other transitions the way nodes are, so the same argument doesn't
-  apply there.
+- **`workflow_edge` was renamed to `workflow_transition`** — table, JPA entity, repository,
+  everywhere.
+- **`workflow_node.node_id` is gapped, not a plain auto-increment** — manually assigned in steps
+  of 10 (100, 110, 120, ...), leaving room to insert a node later without renumbering.
+  `workflow_transition.transition_id` stays a plain auto-increment.
 
-Give every column an explicit name (don't rely on JPA's default field-name-as-column-name — a
-field named `id` should still map to a column named e.g. `node_id`, not `id`).
+A third decision was made later, after the original 3-choice ceiling turned out to be a real
+constraint:
+
+- **`event_code`'s `OPTION_1`/`OPTION_2`/`OPTION_3` values were collapsed into one generic
+  `OPTION` value, plus a new `option_index` column on `workflow_transition`** (1-based position
+  among a node's `OPTION` siblings; null for every other event code). A `QUESTION` node can now
+  offer any number of options without ever touching the enum or its DB `CHECK` constraint again.
+
+Give every column an explicit name (don't rely on JPA's default field-name-as-column-name).
 
 ### `workflow`
 | Column | Type | Notes |
 |---|---|---|
-| `workflow_id` | PK, identity | permanent identity of a business flow (e.g. "AMB shortfall outreach"); survives every redesign |
+| `workflow_id` | PK, identity | permanent identity of a business flow; survives every redesign |
 | `name` | text | |
 
 ### `workflow_version`
@@ -70,45 +67,44 @@ field named `id` should still map to a column named e.g. `node_id`, not `id`).
 | `workflow_id` | FK → workflow | |
 | `version_number` | int | |
 | `status` | enum: `DRAFT` / `PUBLISHED` / `ARCHIVED` | |
-| `start_node_id` | plain `Long`, **not** a JPA relationship | nodes point back at this version, so a `@ManyToOne` here would create a circular insert dependency for no benefit |
+| `start_node_id` | plain `Long`, **not** a JPA relationship | avoids a circular insert dependency |
 | `created_at` | timestamp | |
 | `published_at` | timestamp, nullable | |
 
-Nodes and transitions are scoped to a `workflow_version`, not to `workflow` directly — editing a
-flow creates a new version instead of mutating a live one, so in-flight sessions on the old
-version are never affected.
+Nodes and transitions are scoped to a `workflow_version`, not `workflow` directly — editing a
+flow creates a new version instead of mutating a live one.
 
 ### `workflow_node`
 | Column | Type | Notes |
 |---|---|---|
-| `node_id` | PK, **manually assigned**, gapped by 10 | see decision above — not `@GeneratedValue` |
+| `node_id` | PK, **manually assigned**, gapped by 10 | |
 | `workflow_version_id` | FK → workflow_version | |
-| `node_code` | text | business phase, e.g. `AMB_MENU` — stable across versions, not engine-enforced |
-| `node_type` | enum: `START` / `MESSAGE` / `QUESTION` / `INPUT` / `ACTION` / `END` | drives engine behavior — see section 3 |
+| `node_code` | text | business phase, e.g. `AMB_MENU` |
+| `node_type` | enum: `START` / `MESSAGE` / `QUESTION` / `INPUT` / `ACTION` / `END` | drives engine behavior — §3 |
 | `title` | text | short label |
-| `message` | text | supports `{{placeholder}}` template tokens filled from session context |
+| `message` | text | `{{placeholder}}` tokens filled from session context; internal-only for `START`/`ACTION` nodes (never shown to the customer — see §3) |
 | `back_allowed` | boolean | |
 | `home_allowed` | boolean | |
 | `exit_allowed` | boolean | |
+| `conclusion_code` | text, nullable | set only on `END` nodes — a static tag for the business outcome landing there represents (§7.4) |
 
-A node does **not** contain its own options/choices as columns — a node can have any number of
-outgoing transitions, which a fixed set of columns can't represent, and a JSON blob would lose
-real foreign keys and make "what points into this node" unqueryable.
+A node does not contain its own options as columns — outgoing `workflow_transition` rows do.
 
 ### `workflow_transition` (renamed from `workflow_edge`)
 | Column | Type | Notes |
 |---|---|---|
-| `transition_id` | PK, identity | plain auto-increment — not gapped |
+| `transition_id` | PK, identity | plain auto-increment |
 | `from_node_id` | FK → workflow_node | |
-| `event_code` | enum: `AUTO` / `OPTION_1` / `OPTION_2` / `OPTION_3` / `YES` / `NO` / `SUCCESS` / `FAILURE` / `TIMEOUT` / `INVALID_INPUT` | |
-| `option_label` | text, nullable | populated only when the transition is a customer-visible choice; null for automatic system transitions (`AUTO`/`SUCCESS`/`FAILURE`) |
+| `event_code` | enum: `AUTO` / `OPTION` / `YES` / `NO` / `SUCCESS` / `FAILURE` / `TIMEOUT` / `INVALID_INPUT` | |
+| `option_index` | int, nullable | 1-based position among this node's `OPTION` siblings; null for every other event code |
+| `option_label` | text, nullable | populated only for customer-visible choices |
 | `to_node_id` | FK → workflow_node | |
-| `display_order` | int | for rendering multiple options in order |
+| `display_order` | int | render order |
+| `entry_reason_code` | text, nullable | set only on a handful of "entry" transitions (currently `AMB_MENU`'s 5 options) — which top-level path this choice represents (§7.4) |
 
-One row per possible transition — covers both customer-visible choices and automatic system
-transitions in the same table (deliberately not split into separate "option" and "transition"
-tables — that split was tried earlier and created two divergence-prone sources of truth for the
-same thing: "given this node and this event, go here").
+One row per possible transition — customer-visible choices and automatic system transitions
+share this table on purpose, avoiding two divergence-prone sources of truth for "given this node
+and this event, go here."
 
 ### `workflow_action_config`
 | Column | Type | Notes |
@@ -116,38 +112,38 @@ same thing: "given this node and this event, go here").
 | `node_id` | PK, FK → workflow_node | 1:1 with an `ACTION`-typed node |
 | `endpoint` | text | integration/API endpoint to call |
 | `http_method` | text | |
-| `request_template` | text | how to build the request from session context (not yet interpreted generically — see section 6) |
-| `response_mapping` | text | how to map the response back into session context |
+| `request_template` | text | not interpreted generically — see engine's `simulateAction()` |
+| `response_mapping` | text | ditto |
 | `timeout_ms` | int | |
-| `on_success_event` | enum (EventCode) | which event fires on success |
-| `on_failure_event` | enum (EventCode) | which event fires on failure |
+| `on_success_event` | enum (EventCode) | |
+| `on_failure_event` | enum (EventCode) | |
 
 ### `workflow_entry_point`
 | Column | Type | Notes |
 |---|---|---|
-| `entry_code` | PK, text | short link/campaign code from the WhatsApp message, e.g. `AMB_SHORTFALL_Q2` |
+| `entry_code` | PK, text | e.g. `AMB_SHORTFALL_Q2` |
 | `workflow_version_id` | FK → workflow_version | |
-| `start_node_id` | FK → workflow_node | may differ from the version's own default `start_node_id` |
+| `start_node_id` | FK → workflow_node | may differ from the version's own default |
 | `valid_from` | date | |
 | `valid_to` | date | |
-
-Many-to-one with `workflow_version` — several campaigns can point at the same published flow.
 
 ### `workflow_session`
 | Column | Type | Notes |
 |---|---|---|
 | `session_id` | PK, text (e.g. `S12345`) | |
-| `workflow_version_id` | FK → workflow_version | pins the session to the exact version it started on |
-| `customer_id` | text | |
+| `workflow_version_id` | FK → workflow_version | pins the session to the version it started on |
+| `customer_id` | text | whatever the caller supplies (a phone number, for this demo) — no lookup/validation |
 | `current_node_id` | FK → workflow_node | |
-| `status` | enum: `ACTIVE` / `COMPLETED` / `ABANDONED` / `EXPIRED` / `ERROR` | |
-| `context` | JSON | captured variables (amount entered, computed shortfall, etc.) used to fill `{{placeholder}}` tokens |
+| `status` | enum: `ACTIVE` / `COMPLETED` / `ABANDONED` / `EXPIRED` / `ERROR` | **only `ACTIVE`/`COMPLETED` are ever actually set** — the other three are scaffolding for an idle-session reaper that hasn't been built |
+| `context` | jsonb | captured variables used to fill `{{placeholder}}` tokens |
 | `started_at` | timestamp | |
 | `last_interaction_at` | timestamp | |
 | `ended_at` | timestamp, nullable | |
+| `conclusion_code` | text, nullable | frozen from the arrival node's `conclusion_code` the instant an `END` node is reached (§7.4) |
+| `entry_reason_code` | text, nullable | frozen from context the same moment, originally set when `AMB_MENU` was answered (§7.4) |
 
-Store `context` as a real Postgres `jsonb` column via an `AttributeConverter<Map<String,Object>,
-String>` (Jackson-backed) — not `@Lob`.
+`context` is a real Postgres `jsonb` column via an `AttributeConverter<Map<String,Object>,
+String>` (Jackson-backed), not `@Lob`.
 
 ### `workflow_session_event` (append-only audit log)
 | Column | Type | Notes |
@@ -156,247 +152,216 @@ String>` (Jackson-backed) — not `@Lob`.
 | `session_id` | FK → workflow_session | |
 | `node_id` | FK → workflow_node | node visited |
 | `event_code` | enum (EventCode) | what fired |
-| `payload` | JSON | raw detail for audit |
+| `payload` | jsonb | raw detail, e.g. `{"rawInput": "3"}` |
 | `created_at` | timestamp | |
 
-One row per node visited and event fired. Deliberately separate from the mutable
-`workflow_session` row and deliberately **not** the source for a customer-facing chat transcript
-(it's an audit/analytics trail — if Phase 2 needs "show me the whole conversation," prefer
-recording the engine's own rendered output as it happens, in its own concept, over reconstructing
-it by replaying this log against current session context; see section 7).
+One row per node visited/event fired. Deliberately separate from the mutable `workflow_session`
+row. The original design note here said this table was **not** meant to be replayed as a
+customer-facing chat transcript — that's still true (`chat-ui` keeps its own transcript
+client-side, never reads this table) — but it *is* now replayed for a different purpose: §7.3's
+session-frame API reconstructs a whole session from it, for support/debug/analytics use. One
+consequence: the engine's `END` case explicitly logs an event for itself now (nothing else does
+that for a terminal node type) specifically so a completed session's last message shows up when
+replayed — a real gap found and fixed while building that feature.
 
-**Deferred, not built:** `workflow_node_translation` / `workflow_transition_translation` (i18n) —
-this POC is English-only. Design for it later only when a non-English flow is actually needed;
-don't build the hook speculatively now.
+**Deferred, not built:** `workflow_node_translation`/`workflow_transition_translation` (i18n) —
+still English-only, still not worth building speculatively.
 
 ## 3. Node-type contract — exact engine behavior per `node_type`
 
 | `node_type` | Engine behavior |
 |---|---|
-| `START` | Entry point, one per `workflow_version`. No message shown. Immediately follows its one `AUTO` transition. |
-| `MESSAGE` | Renders `message` (with `{{placeholder}}` substitution from session context), no input expected, auto-advances via its `AUTO` transition. |
-| `QUESTION` | Renders `message`, then derives its options by querying `workflow_transition` for every row with `from_node_id` = this node, ordered by `display_order` — however many rows exist is however many options get shown. Waits for the customer's reply, matches it to an `event_code`, follows that transition. |
-| `INPUT` | Shows a prompt, accepts free text, writes it into `workflow_session.context`, then advances via its `AUTO` transition. **No validation loop yet** — the contract calls for "invalid entry loops back to itself," but implement this as a stub only (unexercised by the seed flow below, which has no `INPUT` node) — don't build real validation speculatively. |
-| `ACTION` | Looks up `workflow_action_config` for the node, calls (simulates, for this POC — no real payment gateway or CRM) the configured backend, follows the `SUCCESS` or `FAILURE` transition based on the result. |
-| `END` | Terminal. Renders `message`, marks the session `COMPLETED`. No outgoing transitions. |
+| `START` | Entry point, one per `workflow_version`. No message shown. Immediately follows its `AUTO` transition. |
+| `MESSAGE` | Renders `message`, no input expected, auto-advances via `AUTO`. |
+| `QUESTION` | Renders `message`, derives options from every `workflow_transition` row with this `from_node_id`, ordered by `display_order`. Waits for a reply, matches it (literal `YES`/`NO`, or numeric `option_index` for `OPTION`), follows that transition. |
+| `INPUT` | Shows a prompt, accepts free text, writes it into `context`, advances via `AUTO`. No validation loop — accepts anything. |
+| `ACTION` | Looks up `workflow_action_config`, simulates the configured backend call, follows `SUCCESS`/`FAILURE`. **Its own `message` is never shown to the customer** — that column is an internal description of the call (e.g. "Calls the payment gateway..."), not customer copy. This wasn't true in the original design (the engine used to render it) — fixed after the internal text leaked into the live chat UI. |
+| `END` | Terminal. Renders `message`, marks the session `COMPLETED`, logs its own arrival event, freezes `conclusion_code`/`entry_reason_code` onto the session (§7.4). No outgoing transitions. |
 
-**A reply that doesn't match any outgoing transition from the current node** should re-show the
-same question (with a short "that wasn't one of the options" prefix) rather than crash or
-silently drop the input. This is the simplest reasonable default for an open design question
-(retry cap? re-send options? something else?), not a considered final answer — don't over-build
-it.
+**A reply that doesn't match any outgoing transition from the current node** re-shows the same
+question (with a "that wasn't one of the options" prefix) rather than crashing or silently
+dropping the input, and is itself logged as an `INVALID_INPUT` event — kept in the audit trail
+(and shown in a replayed session frame) even though a live customer transcript wouldn't need it.
 
 **Not built, deliberately:** a `CONDITION` node type for pure business-rule branching with no
-user input and no backend call (e.g. skip a step because the customer already holds a product).
-Flagged as a known gap, not added speculatively — add it only when a real use case needs it.
+user input and no backend call. Still flagged as a known gap, not added speculatively.
 
-## 4. Runtime walkthrough (worked example, informs how you write the engine)
+## 4. Runtime walkthrough (worked example)
 
-**Arriving at a `QUESTION` node:** read `node_type`, render `message`, query
-`workflow_transition WHERE from_node_id = <node>` ordered by `display_order`, send exactly that
-many options, set `current_node_id`, log a `workflow_session_event`, then wait.
+**Arriving at a `QUESTION` node:** render `message`, query outgoing transitions ordered by
+`display_order`, send exactly that many options, set `current_node_id`, log a
+`workflow_session_event`, wait.
 
-**Customer replies:** match the reply text to an `event_code`, look up that transition's
-`to_node_id`, log the event, move `current_node_id`, repeat the arrival cycle at the new node.
+**Customer replies:** match the reply (literal `YES`/`NO`, or numeric index against `OPTION`
+transitions), look up the matched transition's `to_node_id`, log the event, move
+`current_node_id`, repeat the arrival cycle at the new node.
 
-**Cycle example — `CONFIRM_TOPUP` → "No" → `AMB_MENU`:** the cycle transition points directly at
-the menu node, not at `START` — earlier `MESSAGE` nodes are not replayed, only the target node's
-own message. No rollback needed: "No" happens before the `ACTION` node is ever reached, so
-nothing with side effects has run yet. Context variables survive the loop untouched. The menu
-node has no notion of "first visit" vs. "revisit" — it behaves identically regardless of which
-transition led into it.
+**Cycle example — a failed `ACTION` looping back to `AMB_MENU`:** e.g.
+`GENERATE_FUND_LINK`(200, `ACTION`) → `FAILURE` → `AMB_MENU`(120). The cycle transition points
+directly at the menu node, not at `START` — earlier `MESSAGE` nodes are never replayed, only the
+target node's own message. No rollback needed: nothing with side effects downstream of the
+failure has run yet, and `simulate_failure` (the one-shot test/demo flag every `ACTION` node
+checks) is consumed on the failing attempt, so an immediate retry succeeds. The menu node has no
+notion of "first visit" vs. "revisit" — it behaves identically regardless of which transition led
+into it. (This is also why `entry_reason_code`, §7.4, always reflects the customer's *latest*
+`AMB_MENU` answer rather than their first, if they looped back and answered differently the
+second time.)
 
-## 5. The AMB shortfall flow — exact data to seed
+## 5. The AMB shortfall flow — current shape (not an exhaustive table)
 
-Seed exactly this flow, once, on startup, if `workflow` is empty (check `count() > 0` and skip —
-idempotent, safe to run on every startup). One workflow, one `PUBLISHED` version, entry point
-`AMB_SHORTFALL_Q2`, valid `2026-07-01` to `2026-09-30`.
+Seeded once, idempotently, by `WorkflowSeeder` (`if (workflowRepository.count() > 0) return;`).
+One workflow, one `PUBLISHED` version, entry point `AMB_SHORTFALL_Q2`.
 
-**18 nodes** (`node_id`, `node_code`, `node_type`, `title` / `message` / `back_allowed` /
-`home_allowed` / `exit_allowed`):
+Every seeded message that originally referenced customer-specific data
+(`{{customer_name}}`, `{{amb_required}}`, `{{shortfall_amount}}`, `{{amb_charge}}`) has since been
+rewritten into generic copy — there's no real customer-data lookup in this demo, and the bot never
+asks for or states a specific amount. Where money actually needs to move (funding the account),
+the flow just sends a link (`{{payment_link}}`, generated at runtime) and lets the customer decide
+the amount themselves.
 
-| node_id | node_code | node_type | title | message | back | home | exit |
-|---|---|---|---|---|---|---|---|
-| 100 | START | START | Start | System entry - triggered by the AMB-shortfall batch job | false | false | true |
-| 110 | WELCOME | MESSAGE | Welcome | Hi {{customer_name}}, this is HDFC Bank on WhatsApp. | false | false | true |
-| 120 | AGENDA | MESSAGE | Agenda | Your AMB this quarter is below the required Rs.{{amb_required}}. Let's sort this out - under a minute. | false | false | true |
-| 130 | AMB_MENU | QUESTION | AMB menu | What would you like to do? | true | true | true |
-| 140 | CONFIRM_TOPUP | QUESTION | Confirm top-up | Transfer Rs.{{shortfall_amount}} now to meet your AMB requirement? | true | true | true |
-| 150 | GENERATE_LINK | ACTION | Generate pay link | Calls the payment gateway to create a top-up link | false | false | true |
-| 160 | PAYMENT_LINK_SENT | MESSAGE | Payment link sent | Tap below to complete your Rs.{{shortfall_amount}} transfer: {{payment_link}} | false | false | true |
-| 170 | LINK_FAILED | MESSAGE | Link failed | Something went wrong generating your payment link. Please try again from the HDFC app. | false | true | true |
-| 180 | END_TOPUP | END | Done | Thanks! Once it reflects, your AMB requirement is met. | false | false | false |
-| 190 | REMIND_WHEN | QUESTION | Reminder timing | When should we remind you? | true | true | true |
-| 200 | SET_REMINDER | ACTION | Schedule reminder | Creates a CRM follow-up task for the chosen date | false | false | true |
-| 210 | REMINDER_SET | MESSAGE | Reminder set | Sure, we'll check back with you on {{reminder_date}}. | false | false | true |
-| 220 | END_REMINDER | END | Done | No problem, talk soon! | false | false | false |
-| 230 | AMB_CHARGES_INFO | MESSAGE | Charges info | If AMB isn't maintained, a non-maintenance charge of Rs.{{amb_charge}} applies each quarter. | false | true | true |
-| 240 | CONFIRM_OPT_OUT | QUESTION | Confirm opt-out | Do you want to proceed without maintaining AMB? | true | true | true |
-| 250 | RECORD_OPT_OUT | ACTION | Record preference | Updates the CRM preference flag for this customer | false | false | true |
-| 260 | OPT_OUT_CONFIRMED | MESSAGE | Opt-out confirmed | Noted. The applicable charges will reflect in your next statement. | false | false | true |
-| 270 | END_OPT_OUT | END | Done | Thanks for your time. | false | false | false |
+`AMB_MENU` (120) branches five ways, matching `entry_reason_code`'s taxonomy:
 
-**23 transitions** (`from_node_id`, `event_code`, `option_label`, `to_node_id`, `display_order`):
+1. **`FUND_NOW`** — generates a (simulated) payment link, sends it, ends. No live funded/
+   not-funded branch — the engine has no real async wait, so a genuine later recheck can't show
+   its result in the same turn as the acknowledgment. (A `CHECK_FUNDING_STATUS`/`END_FUNDED`/
+   `END_FUND_PENDING` trio exists in the schema but is currently unreachable from the live graph —
+   kept as a template for whatever eventually sends a real follow-up check, e.g. via a second
+   entry point straight into that `ACTION` node.)
+2. **`FUNDS_SHORTLY`** — asks when (3/7/15 days), schedules a reminder → `REMINDER_SET`.
+3. **`CASH_FLOW_CONSTRAINTS`** — "remind me later" (reuses branch 2's sub-flow, same
+   `REMINDER_SET` ending but a different `entry_reason_code`), "speak to an executive" →
+   `ESCALATED_TO_EXECUTIVE`, or a generic charges redirect → `INFO_REDIRECT`.
+4. **`UNAWARE_OF_REQUIREMENT`** — three informational options, two sharing a generic
+   `INFO_REDIRECT` ending, one ("upgrade benefits") reserved as a named-but-empty placeholder
+   (`ACCOUNT_UPGRADE_JOURNEY`, conclusion `UPGRADE_INTEREST`) for a future real multi-step
+   upgrade sub-flow.
+5. **`CHURN_RISK`** — five distinct, reason-specific endings (no shared "close the account?
+   yes/no" question). Two of them ("service concern," "other — please specify") offer a tappable
+   "Request a callback" button — modeled as an ordinary single-`OPTION` `QUESTION` node feeding a
+   shared logging `ACTION`, no new schema/engine concept needed for a "button."
 
-| from | event_code | option_label | to | order |
-|---|---|---|---|---|
-| 100 | AUTO | — | 110 | 1 |
-| 110 | AUTO | — | 120 | 1 |
-| 120 | AUTO | — | 130 | 1 |
-| 130 | OPTION_1 | Add Rs.4,500 now | 140 | 1 |
-| 130 | OPTION_2 | Remind me later | 190 | 2 |
-| 130 | OPTION_3 | Don't maintain AMB | 230 | 3 |
-| 140 | YES | — | 150 | 1 |
-| 140 | NO | — | 130 | 2 |
-| 150 | SUCCESS | — | 160 | 1 |
-| 150 | FAILURE | — | 170 | 2 |
-| 160 | AUTO | — | 180 | 1 |
-| 170 | AUTO | — | 130 | 1 |
-| 190 | OPTION_1 | In 3 days | 200 | 1 |
-| 190 | OPTION_2 | Next week | 200 | 2 |
-| 200 | SUCCESS | — | 210 | 1 |
-| 200 | FAILURE | — | 130 | 2 |
-| 210 | AUTO | — | 220 | 1 |
-| 230 | AUTO | — | 240 | 1 |
-| 240 | YES | — | 250 | 1 |
-| 240 | NO | — | 130 | 2 |
-| 250 | SUCCESS | — | 260 | 1 |
-| 250 | FAILURE | — | 130 | 2 |
-| 260 | AUTO | — | 270 | 1 |
+Every `ACTION` node's failure branch, and the failure branch of every downstream action across
+all five branches, loops back to `AMB_MENU` (120) — the one convergence point in the whole graph.
 
-Three branches fan out from `AMB_MENU` (130); every "No" or failed action cycles back to it:
-- **Add money now:** `CONFIRM_TOPUP`(140) → YES → `GENERATE_LINK`(150, ACTION) →
-  `PAYMENT_LINK_SENT`(160) → `END_TOPUP`(180). NO or a failed link generation loops back to 130.
-- **Remind me later:** `REMIND_WHEN`(190) → `SET_REMINDER`(200, ACTION) → `REMINDER_SET`(210) →
-  `END_REMINDER`(220). A failed schedule attempt loops back to 130 (no separate failure message).
-- **Skip AMB:** `AMB_CHARGES_INFO`(230) → `CONFIRM_OPT_OUT`(240) → YES → `RECORD_OPT_OUT`(250,
-  ACTION) → `OPT_OUT_CONFIRMED`(260) → `END_OPT_OUT`(270). NO or a failed recording loops back to
-  130.
+**Action configs** — six `ACTION` nodes today, all simulated (no real payment gateway or CRM),
+`timeout_ms=5000`, `on_success_event=SUCCESS`, `on_failure_event=FAILURE`: `GENERATE_FUND_LINK`,
+`CHECK_FUNDING_STATUS` (dormant), `SCHEDULE_FUNDS_REMINDER`, `ROUTE_TO_EXECUTIVE`,
+`CONVERT_SALARY_ACCOUNT`, `LOG_CALLBACK_REQUEST`.
 
-**3 action configs** (all `timeout_ms=5000`, `on_success_event=SUCCESS`, `on_failure_event=FAILURE`):
+**Business-rule enrichment specific to this flow** (§`ENGINE_WALKTHROUGH.md` §3's
+`applyNodeChoiceRule`): `AMB_MENU`'s choice is tagged into context as `entry_reason_code`;
+`FUNDS_TIMING`'s choice becomes a concrete `reminder_date`; `CASH_FLOW_MENU`'s choice is recorded
+as `assistance_type`; `CHURN_REASON_MENU`'s choice (for the 4 fixed-label options) is recorded as
+`reason`. All node-code-keyed special cases, not a generic rule engine — see §6.
 
-| node_id | endpoint | http_method | request_template | response_mapping |
-|---|---|---|---|---|
-| 150 | /payments/links | POST | `{amount: shortfall_amount, customer_id}` | `{payment_link: $.link}` |
-| 200 | /crm/reminders | POST | `{customer_id, remind_on: reminder_date}` | `{reminder_id: $.id}` |
-| 250 | /crm/preferences | POST | `{customer_id, preference: 'AMB_OPT_OUT'}` | `{}` |
+**Simulated backend calls**: every `ACTION` node "succeeds" by default; `simulate_failure=true` in
+session context makes the next one fail exactly once, then the flag is consumed — used to exercise
+every `FAILURE → AMB_MENU` path in tests without a real integration.
 
-**Business-rule enrichment specific to this flow (not a generic hook):** when the customer picks
-`REMIND_WHEN`'s options, translate the choice into a concrete `reminder_date` written to session
-context — `OPTION_1` ("In 3 days") → today + 3 days; `OPTION_2` ("Next week") → today + 7 days.
-Implement this as a small, explicitly node-code-keyed special case in the engine (switched on
-`"REMIND_WHEN".equals(fromNode.getNodeCode())`), not as a generic rule engine — see section 6 for
-why that's the deliberate scope here.
-
-**Simulated backend calls:** the three `ACTION` nodes don't call a real payment gateway or CRM.
-Simulate: always succeed, unless the session context has `simulate_failure=true` set (useful for
-exercising the `FAILURE` → `AMB_MENU` cycle-back paths in tests/manual runs), in which case fail
-exactly once and then consume/clear that flag.
+For the exact current node IDs, messages, and transition table, read `WorkflowSeeder.java` or hit
+`GET /api/graph/ascii`.
 
 ## 6. Engine — scope and deliberate simplifications
 
-- **One flow, hardcoded, not a generic rule engine.** The `ACTION` node behaviors and the
-  `REMIND_WHEN` business rule above are switched on `node_code`, not driven generically off
-  `request_template`/`response_mapping`. This is intentional POC scope — don't build a general
-  flow-authoring/rule-interpretation engine speculatively. Do that work only when a second flow
-  actually needs it.
-- **`start(entryCode, customerId, initialContext)` / `reply(sessionId, rawInput)`** is the shape
-  of the engine's public API — keep it channel-agnostic (usable by a REST controller, a console
-  runner, a WhatsApp webhook adapter, etc. without changes). A turn (`start()` or `reply()`)
-  should return everything that happened automatically until the engine needs input again: every
-  `MESSAGE`/`ACTION` passed through, ending on the `QUESTION`/`INPUT`/`END` node where it stopped.
-- **Template rendering:** `{{placeholder}}` tokens in `message`, filled from session context;
-  missing keys are left untouched (literal `{{token}}`) rather than erroring — useful for
-  placeholders only ever filled at runtime by an `ACTION` node (e.g. `{{payment_link}}`) when
-  rendering the flow's *definition* outside of a live session.
+- **One flow, hardcoded, not a generic rule engine.** `ACTION` node side effects and every
+  business rule in §5 are switched on `node_code`, not driven generically off
+  `request_template`/`response_mapping`. Still intentional POC scope.
+- **`start(entryCode, customerId, initialContext)` / `reply(sessionId, rawInput)`** — the engine's
+  public API, channel-agnostic. A turn returns everything that happened automatically until the
+  engine needs input again.
+- **Template rendering**: `{{placeholder}}` tokens filled from session context; missing keys are
+  left untouched rather than erroring.
+- **Reply matching**: `matchReply()` — literal `YES`/`NO`, or a numeric index against `OPTION`
+  transitions (no NLU, no per-option enum ceiling — see the `event_code` decision in §2).
 
-## 7. REST API — phased
+## 7. REST API
 
-### Phase 1 (build this first)
+### 7.1 `GET /api/graph` / `GET /api/graph/ascii` (originally "Phase 1")
 
-One read-only endpoint: `GET /api/graph` — returns the seeded flow's node/transition graph as
-JSON. Use a **grouped** shape: each node embeds its own outgoing transitions directly, rather
-than two separate `nodes`/`transitions` arrays (forces the client to cross-reference by ID) or a
-deeply nested recursive tree (gets 8+ levels deep on this flow, and needs special-casing for
-nodes reached more than once, like `AMB_MENU`). Example:
+Read-only views of the flow's *definition*. `/api/graph` returns a grouped JSON shape (each node
+embeds its own outgoing transitions). `/api/graph/ascii` is a cycle-aware recursive plain-text
+tree — prints `(already shown above)` on a repeat visit to a convergence node like `AMB_MENU`
+instead of recursing forever. Swagger UI at `/swagger-ui/index.html`.
 
-```json
-{
-  "workflow": "AMB shortfall outreach",
-  "entryPoint": "AMB_SHORTFALL_Q2",
-  "nodes": [
-    {
-      "nodeId": 130, "nodeCode": "AMB_MENU", "nodeType": "QUESTION",
-      "message": "What would you like to do?",
-      "transitions": [
-        { "eventCode": "OPTION_1", "optionLabel": "Add Rs.4,500 now", "toNodeCode": "CONFIRM_TOPUP" },
-        { "eventCode": "OPTION_2", "optionLabel": "Remind me later", "toNodeCode": "REMIND_WHEN" },
-        { "eventCode": "OPTION_3", "optionLabel": "Don't maintain AMB", "toNodeCode": "AMB_CHARGES_INFO" }
-      ]
-    }
-  ]
-}
-```
+### 7.2 `POST /api/conversations`, `POST /api/conversations/{sessionId}/messages`, `GET /api/conversations/{sessionId}` (originally "Phase 2," now built)
 
-(Field renamed to `transitions`, matching the `workflow_transition` rename — adjust if you'd
-rather keep `edges` as public API vocabulary for compatibility with graph-visualization tooling;
-either is fine, just be consistent.)
+The live conversation loop, on top of the same engine. `POST /api/conversations` takes
+`{ entryCode, customerId, context }` — `customerId` is caller-supplied with no lookup (a phone
+number, for the demo UI). Every response is the **full turn's rendered output collapsed into one
+newline-joined `message`**, not per-node granularity — a channel like WhatsApp renders one turn as
+one bubble.
 
-Add Swagger via springdoc-openapi (`springdoc-openapi-starter-webmvc-ui`) — Swagger UI at
-`/swagger-ui/index.html`, OpenAPI JSON at `/v3/api-docs`. A couple of `@Tag`/`@Operation`
-annotations on the controller is enough; don't over-document.
+### 7.3 `GET /api/sessions/{sessionId}/frame`, `GET /api/customers/{customerId}/frame` (added later)
 
-### Phase 2 (deferred — do not build until asked)
+Not part of the original spec. Reconstructs a customer's whole journey — every node visited, what
+options were on screen and which was chosen (including `INVALID_INPUT` retries), and a derived
+`pathSummary` breadcrumb — by replaying `workflow_session_event` against the graph as it stands
+*today* (not a byte-exact historical snapshot; see `CODE_WALKTHROUGH.md` §8 for the tradeoff).
+Built for support/debug lookups and eventual bulk analytics, not for the live customer-facing
+transcript (`chat-ui` never calls these).
 
-Conversation/session endpoints on top of the same engine:
-- `POST /api/conversations` — start a session (hardcode entry point `AMB_SHORTFALL_Q2` and demo
-  customer context server-side for now — `customer_name`, `amb_required`, `shortfall_amount`,
-  `amb_charge` — there's no real customer lookup in this POC).
-- `POST /api/conversations/{sessionId}/replies` — body `{ "input": "OPTION_1" }`.
-- `GET /api/conversations/{sessionId}` — read-only fetch.
+### 7.4 Session conclusions (added later, no dedicated endpoint — queried directly)
 
-All three should return the **full conversation path so far**, not just the latest turn — record
-each turn's rendered output (and the customer's raw input) as it happens, in its own
-webapp-owned concept, rather than reconstructing it later from `workflow_session_event` (that
-table is an audit/analytics log, not designed to be replayed as a customer-facing transcript —
-see the note in section 2).
+`workflow_node.conclusion_code` / `workflow_session.conclusion_code` tag *what* a session's
+outcome was; `workflow_transition.entry_reason_code` / `workflow_session.entry_reason_code` tag
+*why* the customer engaged in the first place (needed because several different paths converge on
+the same `conclusion_code` — see §5's branch 2/3 note). A Postgres view, `session_outcome`
+(`db-backups/migrations/2026-08-11_session_conclusions.sql`), derives an outcome dynamically for
+sessions that never reach an `END` node (`'DROPPED_AT:' || current node_code`), since no
+idle-session reaper exists to tag those eagerly. See `CODE_WALKTHROUGH.md` §9 for the full design
+rationale.
 
 ## 8. Tech stack & setup
 
 - Java 21, Spring Boot 4.x (Spring Web, Spring Data JPA)
-- Postgres 16, via Docker Compose. Check what host port is actually free on this machine before
-  picking one — port 5432 was already taken by something else on a sibling project's machine, so
-  don't assume it's free without checking (`docker ps`).
-- `ddl-auto=update` (schema persists/evolves across restarts — this is meant to be a long-running
-  server, not a one-shot console demo) — safe given seeding is idempotent.
-- springdoc-openapi for Swagger, as above.
-- No Flyway for now — single schema still being iterated on; revisit once it stabilizes.
+- Postgres 16 via Docker Compose, host port **5434** (5432 was already taken on the original dev
+  machine — check `docker ps` before assuming a port is free on a new one).
+- `ddl-auto=update` — schema evolves across restarts (new nullable columns like `conclusion_code`
+  show up automatically the moment the app boots on updated entity classes, *before* any
+  migration SQL runs — the `db-backups/migrations/` files exist to populate/tag data and keep a
+  live dev DB in sync with the seeder's intent, not to create columns).
+- springdoc-openapi for Swagger.
+- No Flyway — still iterating; `db-backups/migrations/` (plain, hand-run SQL files, applied via
+  `docker exec ... psql ... < file.sql`) is the current substitute, used every time the seeded
+  flow or schema changes on a DB that already has data (the seeder itself is idempotent and won't
+  re-seed, so a schema/data change needs its own SQL file applied directly).
 
-**A known environment pitfall, not module-structure-specific, that may recur:** pgjdbc reports
-the JVM's default timezone as a Postgres connection startup parameter. On at least one Windows
-dev machine this resolved to the legacy alias `Asia/Calcutta`, which Postgres's tzdata rejected
-outright (`FATAL: invalid value for parameter "TimeZone"`). If you hit this, pin
-`TimeZone.setDefault(TimeZone.getTimeZone("UTC"))` at the very top of `main()` rather than relying
-on host locale.
+**A known environment pitfall**: pgjdbc reports the JVM's default timezone as a Postgres
+connection startup parameter; on some Windows machines this resolves to the legacy alias
+`Asia/Calcutta`, which Postgres's tzdata rejects outright. Pin
+`TimeZone.setDefault(TimeZone.getTimeZone("UTC"))` at the top of `main()` if you hit this.
 
-## 9. Scope guardrails — don't build these speculatively
+**A recurring dev-loop gotcha**: `spring-boot:run` does not hot-reload a running JVM. Kill any
+existing `java` process (`Get-Process -Name java` / `lsof -i :8080`) before trusting a fresh
+`curl` against newly-compiled code — this has caused real confusion more than once.
 
-- No free-text NLU/understanding — matching a reply to an `event_code` is exact-match only.
-- No `CONDITION` node type (section 3).
-- No `INPUT` validation loop beyond a stub (section 3) — the seed flow has no `INPUT` node to
-  exercise it anyway.
-- No i18n / translation tables (section 2).
-- No session timeout/idle → `EXPIRED` transition logic — `SessionStatus` should have the enum
-  value, but nothing needs to drive it yet.
-- No generic rule/template-interpretation engine (section 6) — one hardcoded flow is the scope.
-- No Phase 2 conversation endpoints until explicitly asked for (section 7).
+## 9. Scope guardrails — still true today
 
-## 10. Open items to flag back, not silently resolve
+- No free-text NLU — a reply is either matched exactly or it isn't.
+- No `CONDITION` node type.
+- No `INPUT` validation loop — accepts and stores whatever's typed (exercised today by
+  `CHURN_REASON_OTHER`).
+- No i18n / translation tables.
+- **No session idle-timeout/abandonment job** — `SessionStatus` has `ABANDONED`/`EXPIRED` values,
+  but nothing drives them. `session_outcome` (§7.4) works around this for reporting without the
+  job existing.
+- No generic rule/template-interpretation engine.
+- The session-frame replay (§7.3) is a re-render against *current* node text, not a byte-exact
+  historical capture — a deliberate, discussed tradeoff, not an oversight.
 
-- QUESTION-node fallback on an unmatched reply (section 3) is a simplest-default, not a
-  considered decision — flag if it matters for a real requirement.
-- Whether the Phase 1 API field is called `edges` or `transitions` (section 7) — either is
-  defensible, pick one and note which.
+## 10. Open items, past and present
+
+Resolved since the original list:
+- ~~Whether the Phase 1 API field is `edges` or `transitions`~~ — `transitions`, consistently.
+- ~~Phase 2 conversation endpoints~~ — built (§7.2).
+- ~~QUESTION-node fallback on unmatched reply~~ — kept as the simplest default (re-show with a
+  prefix), still not revisited as a considered decision, but it's shipped and working across every
+  branch of a much larger flow than it was designed against.
+
+Still open:
+- Whether the session-frame replay should ever be upgraded to byte-exact historical capture
+  (capturing rendered text into `workflow_session_event.payload` at write time) — discussed,
+  deliberately deferred, not built.
+- Whether/when to build a real idle-session-abandonment job.
 - Compliance review (RBI stance on chatbot-initiated financial actions; WhatsApp Business
-  messaging policy — template messages, 24-hour session window) has not been done against this
-  design — out of scope to resolve here, just don't assume it's been cleared.
+  messaging policy) — still not done against this design, still not assumed cleared.

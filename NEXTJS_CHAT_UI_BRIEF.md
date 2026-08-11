@@ -1,162 +1,164 @@
-# Build brief: Next.js chat UI for the HDFC chatbot API
+# chat-ui — current state (was: build brief)
 
-Feed this whole file to Claude Code in a **new, empty Next.js project directory** (or ask it to
-scaffold one first). It is self-contained — it does not assume Claude has access to the
-`chat-bot-service` backend repo, only to this description of its API.
+This started as a self-contained build brief, handed to Claude Code in a fresh, empty Next.js
+project directory with no access to the `chat-bot-service` backend repo — just this file's
+description of its API. **That build is done.** The app has grown past the original brief (a
+second page, a phone-number-based start flow, a typed client for a second backend API) — this
+file now documents what's actually there, so it stays useful as a reference instead of going
+stale as a historical build order. The original brief's requirements are still accurate for the
+one-page chat flow; the additions below are what came after.
 
-## Goal
+## What's actually built
 
-A minimal, single-page chat UI that drives a conversation against the backend below: shows the
-bot's messages, lets the user answer either by tapping a suggested option or typing free text, and
-keeps going until the flow ends. No auth, no multi-conversation history list, no persistence beyond
-the current browser session — this is a test harness for the workflow engine, not a production
-banking UI.
-
-## Stack
-
-- **Next.js, latest LTS, App Router**, TypeScript.
-- Plain `fetch` for API calls — no React Query/SWR/Axios, this app is too small to need them.
-- Tailwind CSS for styling (or plain CSS Modules if Claude prefers — either is fine, just keep it
-  simple, no component library).
-- All state lives in a single client component (`useState`/`useReducer`); no global state manager.
+- **Next.js (App Router), TypeScript, Tailwind.** Plain `fetch`, no React Query/Axios — the app
+  is still small enough not to need them. State lives in per-page `useState`, no global store.
+- **`app/page.tsx`** — the chat flow. Prompts for a **phone number** (not a random generated test
+  ID, as the original brief had it) before starting, so it ties into the journey viewer below by a
+  value a real tester actually types in. Otherwise matches the original brief: bot bubbles,
+  tappable option buttons rendered inline under the message that asked the question (not pinned to
+  a bottom bar — see "UI requirements" below, this was revised after the first pass), free-text
+  input when `options` is empty, disabled/ended state, "start a new conversation."
+- **`app/journey/page.tsx`** — new, not in the original brief. Enter a phone number, see that
+  customer's whole conversation replayed: a session summary card (status, timestamps, whatever
+  landed in `context`), then a timeline of every step — bot bubbles, option chips with the chosen
+  one highlighted, a red call-out for any wrong-answer attempt, and a muted system line for
+  backend `ACTION` steps (e.g. `LOG_CALLBACK_REQUEST — SUCCESS`) so it's clear *why* a value
+  appeared without ever showing internal-only text as if the customer saw it.
+- **`lib/api.ts`** — typed client for both APIs: the original conversation endpoints
+  (`startConversation`/`replyToConversation`/`getConversationStatus`) plus `getCustomerFrame`
+  (`GET /api/customers/{id}/frame`) and its response types (`SessionFrame`, `FrameStep`,
+  `FrameOption`).
+- **`components/`** — `ChatInput`, `MessageBubble`, `MessageList`, `OptionButtons` (the original
+  chat UI split), plus `JourneyStep` (one step in the `/journey` timeline).
+- **`next.config.ts`** — the CORS-avoidance proxy from the original brief (`/api/:path*` →
+  `NEXT_PUBLIC_API_BASE_URL`), still the approach in use, plus `allowedDevOrigins` for testing
+  from another device on the LAN.
 
 ## Backend API contract
 
-Base URL is configurable via `NEXT_PUBLIC_API_BASE_URL` (default `http://localhost:8080`, no
-context path). The backend is a Spring Boot service with **no CORS configuration currently
-enabled** — see "CORS" note at the end before wiring up real requests.
+Base URL configurable via `NEXT_PUBLIC_API_BASE_URL` (default `http://localhost:8080`). Proxied
+through same-origin `/api/...` paths per the CORS note below — always call the relative path, not
+the absolute backend URL, from client code.
 
-### 1. Start a conversation
+### Conversation endpoints (original brief, unchanged)
 
 ```
 POST /api/conversations
-Content-Type: application/json
+{ "entryCode": "AMB_SHORTFALL_Q2", "customerId": "<phone number>", "context": {} }
+→ 201, ConversationResponse
 
-{
-  "entryCode": "AMB_SHORTFALL_Q2",
-  "customerId": "<any non-blank string, e.g. a made-up customer id for testing>",
-  "context": {}
-}
-```
-
-- `entryCode` and `customerId` are required (non-blank). `context` is an optional free-form
-  `Record<string, any>` — send `{}` if you have nothing to seed.
-- `entryCode` is currently hardcoded to the single seeded flow: `"AMB_SHORTFALL_Q2"`. Put it behind
-  a constant, not user input.
-- Response `201 Created`, body is a `ConversationResponse` (shape below).
-
-### 2. Reply to the current question
-
-```
 POST /api/conversations/{sessionId}/messages
-Content-Type: application/json
+{ "rawInput": "<typed text, or the option's 1-based index as a string, or YES/NO>" }
+→ 200, ConversationResponse
 
-{ "rawInput": "<user's typed text, or the eventCode of the option they tapped>" }
-```
-
-- `rawInput` is required (non-blank). If the user taps a suggested option, send that option's
-  `eventCode` value (e.g. `"YES"`) as the string; if they type free text, send exactly what they
-  typed.
-- Response `200 OK`, body is a `ConversationResponse`.
-
-### 3. (Optional) Poll current status without advancing
-
-```
 GET /api/conversations/{sessionId}
+→ 200, ConversationResponse (point-in-time snapshot, doesn't advance)
 ```
-
-Returns a point-in-time snapshot — useful only if you want to support "resume this session after a
-page reload" via a `sessionId` stored in `localStorage`. Not required for a first pass; skip unless
-time permits.
-
-### Response shape — `ConversationResponse` (returned by both start and reply)
 
 ```ts
 type SessionStatus = "ACTIVE" | "COMPLETED" | "ABANDONED" | "EXPIRED" | "ERROR";
 
 interface OptionResponse {
-  eventCode: string;   // one of a fixed enum, e.g. "YES" | "NO" | "OPTION_1" | "OPTION_2" | "OPTION_3" | "AUTO" | ...
-  optionLabel: string; // human-readable text to show on the button
+  eventCode: string;        // "OPTION" | "YES" | "NO" | ...
+  optionIndex: number | null; // null for YES/NO - only OPTION transitions carry an index
+  optionLabel: string;
 }
 
 interface ConversationResponse {
   sessionId: string;
   status: SessionStatus;
-  message: string;              // already newline-joined; render each \n as a new line/paragraph inside one bubble
+  message: string;           // newline-joined; render each \n as a new paragraph in one bubble
   currentNodeId: number | null;
-  options: OptionResponse[];    // empty array = expects free-text reply; non-empty = show these as buttons
+  options: OptionResponse[]; // empty = expects free text; non-empty = show as buttons
 }
 ```
 
-Turn logic for the UI:
-- Append `message` as a new bot bubble each time you get a response (from start or reply).
-- If `options` is non-empty, render them as tappable buttons instead of (or above) a text input;
-  tapping one sends its `eventCode` as `rawInput` to the reply endpoint.
-- If `options` is empty and `status === "ACTIVE"`, show a free-text input instead.
-- If `status !== "ACTIVE"` (`COMPLETED`, `ABANDONED`, `EXPIRED`, `ERROR`), the conversation is over:
-  disable input, show a "conversation ended" state, optionally offer a "start a new conversation"
-  button that re-calls `POST /api/conversations`.
+**One change from the original brief**: there is no fixed `OPTION_1`/`OPTION_2`/`OPTION_3` enum
+anymore — a `QUESTION` node can have any number of options. When the user taps an option, send
+its `optionIndex` (as a string, e.g. `"3"`) for an `OPTION`-typed choice, or the literal word for
+`YES`/`NO`. `eventCode` alone is no longer enough to identify which option was picked.
 
-### Error shape
+### Session frame endpoint (new, not in the original brief)
 
-Non-2xx responses return:
+```
+GET /api/customers/{customerId}/frame
+→ 200, SessionFrame   (customerId's most recent session, replayed end to end)
+
+GET /api/sessions/{sessionId}/frame
+→ 200, SessionFrame   (a specific session by ID)
+```
 
 ```ts
-interface ApiError {
-  error: string;   // "NOT_FOUND" | "CONFLICT" | "VALIDATION_FAILED"
-  message: string;
+type NodeType = "START" | "MESSAGE" | "QUESTION" | "INPUT" | "ACTION" | "END";
+type EventCode = "AUTO" | "OPTION" | "YES" | "NO" | "SUCCESS" | "FAILURE" | "TIMEOUT" | "INVALID_INPUT";
+
+interface FrameOption {
+  optionIndex: number | null;
+  optionLabel: string;
+  chosen: boolean;
+}
+
+interface FrameStep {
+  sequenceNo: number;
+  timestamp: string;
+  nodeCode: string;
+  nodeType: NodeType;
+  title: string;
+  message: string | null;       // null for START/ACTION - never customer-facing
+  optionsShown: FrameOption[];  // non-empty only for a QUESTION node's reply step
+  rawInput: string | null;
+  eventCode: EventCode;
+  matched: boolean;             // false only for an INVALID_INPUT attempt
+}
+
+interface SessionFrame {
+  sessionId: string;
+  customerId: string;
+  workflowVersionId: number;
+  status: SessionStatus;
+  startedAt: string;
+  lastInteractionAt: string;
+  endedAt: string | null;
+  context: Record<string, unknown>;
+  steps: FrameStep[];
+  pathSummary: string;   // e.g. "I no longer actively use this account > Service concern > Request a callback"
 }
 ```
 
-- `404 NOT_FOUND` — unknown `sessionId` or unknown `entryCode`.
-- `409 CONFLICT` — replied to a session that isn't waiting for input anymore (e.g. already ended).
-- `400 VALIDATION_FAILED` — blank `entryCode`/`customerId`/`rawInput`.
+`404 NOT_FOUND` if the customer/session has no matching session yet — surface as "no conversation
+found," same inline-banner pattern as the conversation endpoints' errors.
 
-Surface `message` to the user in a small inline error banner (e.g. above the input) rather than a
-blocking alert; don't crash the chat on error, just let them retry.
+### Error shape (unchanged)
 
-## UI requirements
+```ts
+interface ApiErrorBody { error: string; message: string; } // "NOT_FOUND" | "CONFLICT" | "VALIDATION_FAILED"
+```
+`404` unknown session/entry code · `409` replied to a session no longer waiting for input ·
+`400` blank required field. Surface `message` inline, don't crash the chat on error.
 
-- Single page (`app/page.tsx` or a route of your choosing) with:
-  - A scrolling message list — bot bubbles left-aligned, user bubbles right-aligned, auto-scroll to
-    bottom on new message.
-  - A "Start conversation" state before the first message is sent (e.g. a button, or auto-start on
-    page load — either is fine, pick one and keep it simple).
-  - Option buttons rendered below the last bot message when `options` is non-empty.
-  - A text input + send button, disabled while a request is in flight or when the session has
-    ended, shown only when free-text input is expected.
-  - A loading indicator (e.g. "…typing" bubble or spinner) while waiting on the API.
-  - The inline error banner described above.
-- Keep the component tree small: a root client component is fine for this scope; split into
-  `MessageList`, `MessageBubble`, `OptionButtons`, `ChatInput` only if it keeps `page.tsx` readable.
-- No design system needed — clean, readable, mobile-friendly single column, that's enough.
+## UI requirements (as-built, with one revision from the original brief)
 
-## Project setup expectations
+- Chat page: scrolling message list, bot bubbles left / user bubbles right, auto-scroll on new
+  message; phone-number entry before the first message; a text input shown only when `options` is
+  empty; a loading indicator while a request is in flight; the inline error banner.
+- **Option buttons render inline, directly under the message that asked the question** — in the
+  scrollable flow, one per line, in the order the backend sent them. The original brief called for
+  them "below the last bot message" without specifying placement precisely; the first pass put
+  them in a separate fixed bar pinned to the bottom of the screen, which read wrong once real
+  conversations got longer than one screen — revised to render as part of the message flow
+  instead.
+- Journey page: phone-number entry, a session-summary card, then the timeline described above.
+- No design system — clean, readable, mobile-friendly single column is still the bar.
 
-- `npx create-next-app@latest` (TypeScript, App Router, Tailwind — accept the standard prompts).
-- Put the API base URL and a small typed `fetch` wrapper (start/reply/getStatus + the TS interfaces
-  above) in one file, e.g. `lib/api.ts`, so the UI code isn't littered with raw `fetch` calls.
-- `.env.local` with `NEXT_PUBLIC_API_BASE_URL=http://localhost:8080`.
-- No test suite required for this pass; a working `npm run dev` against the running backend is the
-  bar.
+## CORS note (still accurate)
 
-## CORS note (read before wiring up requests)
+The backend has no CORS configuration. The Next.js rewrite proxy in `next.config.ts` (`/api/:path*`
+→ the backend) is the approach in use — same-origin requests from the browser, no backend change
+needed. If you're adding a new backend endpoint, it's already covered by the wildcard proxy; no
+`next.config.ts` change required.
 
-The backend currently has **no CORS configuration**, so a browser `fetch` from
-`http://localhost:3000` straight to `http://localhost:8080` will be blocked. Two options — pick
-whichever is faster for Claude to implement, don't do both:
+## Still out of scope
 
-1. **Next.js rewrite proxy (recommended, no backend change needed):** in `next.config.ts`, add a
-   `rewrites()` entry that proxies `/api/:path*` on the Next.js dev server to
-   `${API_BASE_URL}/api/:path*`, and point the frontend at same-origin `/api/...` instead of the
-   absolute backend URL. This avoids touching the Spring Boot service at all.
-2. **Backend CORS config:** if the rewrite approach doesn't fit, ask separately for a
-   `@CrossOrigin`/`CorsConfigurationSource` bean to be added to the `chat-bot-service` repo allowing
-   `http://localhost:3000` — that's a backend-repo change, out of scope for this Next.js task.
-
-Default to option 1.
-
-## Out of scope for this pass
-
-Auth/login, multiple concurrent conversations, conversation history persistence across sessions,
-i18n, animations beyond basic transitions, and any styling beyond "clean and usable."
+Auth/login, multiple concurrent conversations in one tab, conversation history persisted across
+browser sessions (the journey viewer reads it from the *backend*, not local storage), i18n,
+animations beyond basic transitions.

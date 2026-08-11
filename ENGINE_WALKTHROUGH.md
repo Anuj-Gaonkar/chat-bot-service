@@ -1,13 +1,14 @@
 # chat-bot-service — `engine` Package Deep Dive
 
-This builds directly on **`CODE_WALKTHROUGH.md` §6** ("The engine package — the heart of the
-service"). That section gives you the narrative — *what the engine is for and the mental model
-behind it* (a session walks a straight line through a graph that itself has cycles). This
-document assumes you've read that, and goes one level deeper: **every method in
-`engine/`, what it does, and why it's written the way it is.**
+This builds directly on **`CODE_WALKTHROUGH.md` §6** ("The engine package"). That section gives
+you the narrative — *what the engine is for and the mental model behind it* (a session walks a
+straight line through a graph that itself has cycles). This document goes one level deeper:
+**every method in `engine/`, what it does, and why it's written the way it is** — matching
+`WorkflowEngine.java` as it stands today (generic `OPTION`+index matching, no per-option enum
+ceiling, `ACTION` nodes never render customer-facing text, conclusions frozen on completion).
 
-Read order below is bottom-up — the small DTOs first (what the engine hands back), then the one
-utility class, then `WorkflowEngine` itself, method by method, roughly in call order.
+Read order below is bottom-up — the small DTOs first, then the templating utility, then
+`WorkflowEngine` itself, roughly in call order.
 
 ---
 
@@ -20,52 +21,45 @@ public record RenderedStep(String nodeCode, NodeType nodeType, String message) {
 }
 ```
 
-One node's fully-rendered output — its `{{placeholders}}` already substituted with real values.
-It's a `record`, not a class, because it's pure, immutable data with no behavior: three fields
-in, three accessors out, nothing else. There's no builder, no setters — once the engine renders
-a step it never needs to be mutated again.
+One node's fully-rendered output — its `{{placeholders}}` already substituted. Immutable, no
+behavior — three fields in, three accessors out.
 
 ### `OptionView.java`
 
 ```java
-public record OptionView(EventCode eventCode, String optionLabel) {
+public record OptionView(EventCode eventCode, Integer optionIndex, String optionLabel) {
 }
 ```
 
-One selectable option, present only when the engine stopped at a node that's actually waiting
-for a choice (a `QUESTION`). `eventCode` is what the client must send back in `reply()` to pick
-this option (e.g. `OPTION_1`); `optionLabel` is the human-readable button text (e.g. "Add
-Rs.4,500 now"). Splitting these into two fields — rather than making the client parse the label
-back into an event code — keeps the reply contract exact-match and unambiguous: the caller
-echoes `eventCode` verbatim, no string-matching on customer-facing copy required.
+One selectable option, present only when the engine stopped at a `QUESTION` node waiting for a
+reply. `optionIndex` is **null for `YES`/`NO` transitions** — those are matched literally, the
+channel echoes back the word itself — and set for the generic `OPTION` event code, which is the
+1-based position the channel must echo back verbatim (e.g. `"3"`) to pick that option. There is
+no `OPTION_1`/`OPTION_2`/`OPTION_3` split anymore; `eventCode` alone is no longer enough to
+identify *which* option was picked on a node with more than one `OPTION` transition, which is
+exactly why `optionIndex` exists as its own field instead of being folded into `eventCode`.
 
 ### `EngineTurnResult.java`
 
 ```java
 public record EngineTurnResult(String sessionId, SessionStatus status, List<RenderedStep> steps,
-        String currentNodeCode, List<OptionView> options) {
+        String currentNodeCode, Long currentNodeId, List<OptionView> options) {
 }
 ```
 
-The full return value of one `start()`/`reply()` call. Two fields are worth pausing on:
+The full return value of one `start()`/`reply()` call.
 
-- **`steps` is a `List`, not a single `RenderedStep`** — because one call can legitimately walk
-  through several nodes automatically (e.g. `WELCOME` → `AGENDA` → `AMB_MENU` in a single
-  `start()`) before it has to stop. The caller needs *all* of that rendered output, in order, not
-  just the last one.
-- **`options` is always populated, even when it's empty** — a `QUESTION` node returns its
-  outgoing choices, but `MESSAGE`/`ACTION`/`INPUT`/`END` nodes return `List.of()` rather than
-  `null`. This means calling code never has to null-check before checking `.isEmpty()` — a small
-  thing, but it removes a whole class of NPE bugs at every call site.
+- **`steps` is a `List`, not a single `RenderedStep`** — one call can walk through several nodes
+  automatically (e.g. `INTRO` → `AMB_MENU` in a single `start()`) before it has to stop.
+- **`currentNodeId` alongside `currentNodeCode`** — added so a REST client (or the frame API) has
+  a stable numeric id to key off, not just the human-readable code.
+- **`options` is always populated, even when empty** — `List.of()`, never `null`, for
+  `MESSAGE`/`ACTION`/`INPUT`/`END` nodes, so callers never null-check before `.isEmpty()`.
 
-The class-level Javadoc explicitly calls this "deliberately channel-agnostic — not a REST DTO."
-That's a real constraint, not a stylistic note: nothing in this record knows about HTTP status
-codes, JSON field naming conventions, or WhatsApp message formats. When the conversation REST API
-was added on top of this engine, it introduced its own `ConversationResponse`/`OptionResponse`
-records in the `conversation` package specifically so this record could keep evolving
-independently of whatever shape a specific channel's contract needs — e.g. `ConversationResponse`
-collapses `steps` into a single newline-joined `message` string for a single-bubble channel like
-WhatsApp, without `EngineTurnResult` itself losing per-node granularity.
+Deliberately channel-agnostic — not a REST DTO. The `conversation` package's
+`ConversationResponse` is the REST-facing shape built on top of this (see
+`CODE_WALKTHROUGH.md` §7), specifically so this record can keep evolving independently of
+whatever a given channel's contract needs.
 
 ---
 
@@ -88,50 +82,37 @@ public static String render(String template, Map<String, Object> context) {
 }
 ```
 
-**What it does**: `PLACEHOLDER` is the regex `\{\{(\w+)\}\}` — matches `{{token}}` and captures
-`token`. For every match found in `template`, it looks the token up in `context`; if present, the
-match is replaced with `String.valueOf(value)`, otherwise the match is left exactly as it was
-(`matcher.group(0)`, the whole `{{token}}` literal). `Matcher.appendReplacement`/`appendTail` is
-the standard idiom for "walk every regex match and rebuild the string with substitutions" — it's
-more efficient than repeated `String.replace()` calls because it builds the result in one pass
-instead of re-scanning the string once per token.
+`PLACEHOLDER` is `\{\{(\w+)\}\}`. For every `{{token}}` match, look it up in `context`; if
+present, substitute `String.valueOf(value)`, otherwise leave the match exactly as written.
 
-**Why "leave it literal" instead of throwing or blanking it out**: this is the one design choice
-worth remembering. Two different callers use this method under very different conditions:
+**Why "leave it literal" instead of throwing or blanking it out**: three different callers use
+this under different conditions — `WorkflowEngine.renderStep()` (live session, real context
+values), `GraphService.messageSuffix()` (rendering the flow's *definition* for the ASCII diagram,
+against an empty context — see below), and `SessionFrameService` (replaying a finished session
+against its *final* context). A missing key is never actually an error condition for any of
+these callers; it's either "this value hasn't been generated yet in this session" or "this
+diagram has no session at all." Throwing would crash the diagram endpoint on any node
+referencing a runtime-only value; blanking would silently hide that anything was omitted.
 
-1. `WorkflowEngine.renderStep()` — rendering a node's message *inside a live session*, where
-   `context` has real values (`customer_name`, a generated `payment_link`, etc.).
-2. `GraphService.messageSuffix()` (in the `graph` package, see `CODE_WALKTHROUGH.md` §7) —
-   rendering the *same* node messages for the `/api/graph/ascii` diagram, using a small hardcoded
-   `DEMO_CONTEXT` that only has a handful of keys. A key like `{{payment_link}}` is genuinely
-   never going to exist there — it's only generated at runtime by an `ACTION` node mid-session.
-
-If missing keys threw, the ASCII diagram endpoint would crash on any node message referencing a
-runtime-only value. If missing keys were blanked out, the diagram would silently show `"Here's
-your link: "` with no indication anything was omitted. Leaving the token literal
-(`"Here's your link: {{payment_link}}"`) is honest about what's missing without breaking either
-caller — it degrades gracefully for the diagram use case and never fires at all in the live
-session case (because by the time a node needing `payment_link` is rendered, the `ACTION` node
-that generates it has already run).
-
-**Why a `final` class with a private constructor and static method**: this is a pure function
-with no state — there's nothing to instantiate. The private constructor is the standard Java
-idiom for "this class isn't meant to be instantiated, ever," and `final` closes off subclassing
-as an escape hatch around that.
+**One change worth flagging**: every seeded node message that used to reference customer-specific
+data (`{{customer_name}}`, `{{amb_required}}`, `{{shortfall_amount}}`, `{{amb_charge}}`) has since
+been rewritten into generic copy — this is a demo-scale service with no real customer-data lookup,
+so those placeholders were removed entirely rather than ever being filled. `GraphService` used to
+render the ASCII diagram against a small hardcoded `DEMO_CONTEXT` map specifically to fill those
+in; that map is gone now, and the diagram renders against `Map.of()` (empty context). The only
+placeholder left in any seeded message is `{{payment_link}}`, which genuinely is only available
+inside a live session (an `ACTION` node generates it at runtime) — on the diagram it renders
+literal, same as always.
 
 ---
 
 ## 3. `WorkflowEngine.java` — method by method
 
-Quick orientation before the methods: the class is a `@Service` with `@RequiredArgsConstructor`
-injecting six repositories, and every public method is `@Transactional`. That last point matters
-more than it looks — `start()` and `reply()` can each touch four or five tables (session,
-session event, node, transition, action config) across several repository calls; wrapping the
-whole turn in one transaction means a mid-turn failure (say, the `ACTION` node's simulated call
-throwing) rolls back the *entire* turn instead of leaving the session parked in a half-updated
-state.
+The class is a `@Service` with `@RequiredArgsConstructor` injecting six repositories; every
+public method is `@Transactional` — a mid-turn failure rolls back the *entire* turn instead of
+leaving a session parked half-updated.
 
-### `start(entryCode, customerId, initialContext)` — line 46
+### `start(entryCode, customerId, initialContext)`
 
 ```java
 @Transactional
@@ -156,36 +137,19 @@ public EngineTurnResult start(String entryCode, String customerId, Map<String, O
 }
 ```
 
-**What it does**: resolves the `entryCode` (e.g. `AMB_SHORTFALL_Q2`, the short code that would
-come from a WhatsApp campaign link) to a `WorkflowEntryPoint` row, which pins down *which
-workflow version* and *which node* this conversation begins at. Builds a brand-new
-`WorkflowSession`, not yet persisted, and hands it — along with the resolved start node — to
-`advanceAndFinalize()`, which does the actual walking and is the method that eventually saves it.
+Resolves `entryCode` to a `WorkflowEntryPoint`, builds a brand-new (not yet persisted)
+`WorkflowSession`, hands it to `advanceAndFinalize()` — the single place any session actually gets
+saved, whether it got there via `start()` or `reply()`. `customerId` is whatever the caller
+supplies with no validation or lookup — for this demo it's typically a phone number, entered by
+whoever's driving `chat-ui`.
 
-**Why it doesn't save the session itself**: notice `workflowSessionRepository.save(...)` never
-appears in this method. That's deliberate — `advanceAndFinalize()` is the single place a session
-gets persisted, regardless of whether it got there via `start()` or `reply()`. Having one save
-point instead of two means there's exactly one place to reason about "when does a session's state
-actually hit the database," rather than two call paths that could drift out of sync.
+`new LinkedHashMap<>(initialContext)` is a defensive copy — `context` gets mutated heavily later
+(`applyNodeChoiceRule`, `simulateAction`, `handleInputReply`), and holding the caller's own map
+object would mean those mutations leak back into whatever the caller does with that map
+afterward. `LinkedHashMap` (not `HashMap`) preserves insertion order for readable debug/log output
+— functionally irrelevant, but nice when eyeballing a session's `context` jsonb column.
 
-**Why `new LinkedHashMap<>(initialContext)` instead of using the map the caller passed in
-directly**: defensive copy. `WorkflowSession.context` gets mutated later (e.g.
-`simulateAction()` writes `payment_link` into it, `applyRemindWhenRule()` writes
-`reminder_date`). If the engine held onto the caller's own map object, mutating it would be
-mutating something the caller might still hold a reference to and reuse elsewhere — a classic
-shared-mutable-state bug. Copying breaks that link. `LinkedHashMap` specifically (not
-`HashMap`) preserves insertion order, which matters for nothing functionally here but makes
-`show-sql`/debug logs and any future "dump the context" tooling deterministic and readable
-instead of hash-order scrambled.
-
-**Why `IllegalArgumentException` for an unknown entry code**: this is the engine's chosen
-convention for "the caller gave me an identifier that doesn't resolve to anything" — see the
-`web.GlobalExceptionHandler` in the `conversation` package, which maps this specific exception
-type to an HTTP 404 for the REST layer. The engine itself doesn't know about HTTP; it just picks
-a standard JDK exception whose *meaning* ("bad argument, not found") a caller in any channel can
-reasonably interpret.
-
-### `reply(sessionId, rawInput)` — line 68
+### `reply(sessionId, rawInput)`
 
 ```java
 @Transactional
@@ -203,31 +167,19 @@ public EngineTurnResult reply(String sessionId, String rawInput) {
 }
 ```
 
-**What it does**: loads the session and whatever node it's currently parked at, stamps
-`lastInteractionAt`, then dispatches purely on that node's `nodeType`. Only two types make sense
-to "reply" to — `QUESTION` (pick one of several options) and `INPUT` (free text) — everything
-else falls to the `default` branch and throws.
+Loads the session and its current node, stamps `lastInteractionAt` once (before dispatching, so
+every successful path updates it without repeating the line in both handlers), dispatches purely
+on `nodeType`. Only `QUESTION`/`INPUT` legitimately wait for input — anything else means the
+caller double-submitted, retried a stale request, or is replying to an already-finished session,
+and that's loud (`IllegalStateException` → `409 Conflict` at the REST layer), not silently
+ignored.
 
-**Why the `default` branch throws instead of silently ignoring the call**: a `MESSAGE`, `ACTION`,
-or `END` node was never waiting for input in the first place — the engine auto-advances through
-those inside `advanceAndFinalize()` without ever returning control to the caller at them. If
-`reply()` gets called against a session parked at one of those, that's a caller bug (double-
-submitting a reply after a session already ended, a stale client retry, etc.), and it should be
-loud, not silently swallowed — which is exactly the kind of "state conflict" the REST layer maps
-to `409 Conflict` rather than either succeeding unexpectedly or returning a generic `500`.
-
-**Why `lastInteractionAt` is stamped here, before dispatching**, rather than inside each handler:
-every successful path through `reply()` should update it, and doing it once at the top avoids
-repeating the same line in both `handleQuestionReply()` and `handleInputReply()`.
-
-### `handleQuestionReply(session, current, rawInput)` — line 81
+### `handleQuestionReply(session, current, rawInput)`
 
 ```java
 private EngineTurnResult handleQuestionReply(WorkflowSession session, WorkflowNode current, String rawInput) {
     List<WorkflowTransition> options = outgoing(current.getNodeId());
-    Optional<EventCode> parsed = parseEventCode(rawInput);
-    Optional<WorkflowTransition> match = parsed
-            .flatMap(ec -> options.stream().filter(t -> t.getEventCode() == ec).findFirst());
+    Optional<WorkflowTransition> match = matchReply(options, rawInput);
 
     if (match.isEmpty()) {
         logEvent(session, current, EventCode.INVALID_INPUT, rawInputPayload(rawInput));
@@ -236,87 +188,94 @@ private EngineTurnResult handleQuestionReply(WorkflowSession session, WorkflowNo
         String message = "Sorry, that wasn't one of the options. " + rendered;
         return new EngineTurnResult(session.getSessionId(), session.getStatus(),
                 List.of(new RenderedStep(current.getNodeCode(), current.getNodeType(), message)),
-                current.getNodeCode(), toOptionViews(options));
+                current.getNodeCode(), current.getNodeId(), toOptionViews(options));
     }
 
-    EventCode eventCode = parsed.get();
-    if ("REMIND_WHEN".equals(current.getNodeCode())) {
-        applyRemindWhenRule(session, eventCode);
-    }
-    logEvent(session, current, eventCode, rawInputPayload(rawInput));
-    WorkflowNode next = loadNode(match.get().getToNodeId());
+    WorkflowTransition transition = match.get();
+    applyNodeChoiceRule(session, current, transition);
+    logEvent(session, current, transition.getEventCode(), rawInputPayload(rawInput));
+    WorkflowNode next = loadNode(transition.getToNodeId());
     return advanceAndFinalize(session, next);
 }
 ```
 
-**What it does**, step by step:
-1. Load every possible outgoing transition from this `QUESTION` node — these *are* the valid
-   answers.
-2. Try to parse the raw customer text into an `EventCode` (see `parseEventCode()` below) and,
-   only if that parse succeeded, look for a transition whose `eventCode` matches it.
-3. **No match** (either the parse failed, or it parsed to a real `EventCode` that just isn't one
-   of *this* node's options): log an `INVALID_INPUT` audit event, save the session as-is (its
-   `currentNodeId` is untouched), and return a result that re-renders the *same* question with a
-   "Sorry, that wasn't one of the options." prefix. Crucially, this returns directly — it does
-   **not** call `advanceAndFinalize()` — because the session hasn't actually moved anywhere.
-4. **Match found**: one flow-specific special case fires first — if this node's code is literally
-   `"REMIND_WHEN"`, `applyRemindWhenRule()` runs before anything else, because it needs to know
-   *which option* was chosen to compute a date. Then the event is logged (this time with the real
-   `eventCode`, not `INVALID_INPUT`), and control passes to `advanceAndFinalize()` with the
-   matched transition's target node — which is what actually moves `currentNodeId` forward and
-   persists it.
+1. Load every outgoing transition from this `QUESTION` node — the valid answers.
+2. Try to match the raw reply to one of them via `matchReply()` (below).
+3. **No match**: log `INVALID_INPUT`, save the session *unchanged* (`currentNodeId` doesn't
+   move), and return a result that re-renders the *same* question with a "Sorry, that wasn't one
+   of the options." prefix. Returns directly — does **not** call `advanceAndFinalize()` — because
+   nothing actually moved.
+4. **Match found**: `applyNodeChoiceRule()` runs first (a node-code-keyed business rule, if this
+   node has one — see below), then the event is logged with the real `eventCode`, and control
+   passes to `advanceAndFinalize()` with the matched transition's target.
 
-**Why parsing and matching are two separate steps** (`parseEventCode` then a stream filter)
-instead of one combined lookup: it cleanly separates two different failure reasons that both
-collapse to the same user-facing outcome. "You typed something that isn't a recognized event
-code at all" (parse failure) and "you typed a real event code, but it's not one of the choices
-*this specific question* offers" (parse succeeded, no matching transition) are different bugs to
-debug later, but the customer experience for both is identical — re-show the question. Keeping
-them as two `Optional`s chained with `flatMap` means that logic reads as one sentence ("parse it,
-then find a matching option") without a nested `if/else` pyramid.
+### `matchReply(options, rawInput)`
 
-**Why the invalid-reply path calls `TemplateRenderer.render()` itself** instead of reusing
-`renderStep()`: `renderStep()` (see below) always renders the node's own unmodified message.
-Here the message needs a prefix stitched on ("Sorry, that wasn't one of the options. " + the
-normal rendered text), so it renders directly and builds the `RenderedStep` inline rather than
-forcing `renderStep()` to grow an optional-prefix parameter for one caller.
+```java
+private Optional<WorkflowTransition> matchReply(List<WorkflowTransition> options, String rawInput) {
+    if (rawInput == null) {
+        return Optional.empty();
+    }
+    String trimmed = rawInput.trim();
 
-**Why `"REMIND_WHEN".equals(current.getNodeCode())`** — a literal string compare on a node code —
-**rather than a generic mechanism**: this is the same "hardcode it, don't build a rule engine"
-choice `CODE_WALKTHROUGH.md` calls out repeatedly. There is exactly one flow-specific business
-rule in the entire seeded flow (translate "in 3 days"/"next week" into an actual date), so it's
-written as the smallest possible thing that could work: one `if`, keyed directly off the one node
-code where it applies. A generic "attach a rule to any node" mechanism would be speculative
-infrastructure for a requirement that doesn't exist yet.
+    if (trimmed.equalsIgnoreCase("YES") || trimmed.equalsIgnoreCase("NO")) {
+        EventCode literal = EventCode.valueOf(trimmed.toUpperCase());
+        return options.stream().filter(t -> t.getEventCode() == literal).findFirst();
+    }
 
-### `handleInputReply(session, current, rawInput)` — line 106
+    try {
+        int index = Integer.parseInt(trimmed);
+        return options.stream()
+                .filter(t -> t.getEventCode() == EventCode.OPTION && index == t.getOptionIndex())
+                .findFirst();
+    } catch (NumberFormatException e) {
+        return Optional.empty();
+    }
+}
+```
+
+This is the whole "understanding" the engine does of a reply — still exact-match only, no NLU,
+but the *mechanism* changed from the original design. There used to be a fixed `EventCode` enum
+value per option (`OPTION_1`, `OPTION_2`, `OPTION_3` — a hard ceiling of 3 choices per node) that
+`Enum.valueOf()` parsed the raw reply straight into. That's gone: every multiple-choice reply
+that isn't literally `"YES"`/`"NO"` is now parsed as a plain integer and matched against
+`optionIndex` on that node's `OPTION`-typed transitions — a `QUESTION` node can now offer any
+number of options without ever touching the `EventCode` enum or its DB `CHECK` constraint again.
+`NumberFormatException` (garbage input, or an `INPUT`-style free-text-looking string) and "parsed
+fine but no `OPTION` transition has that index" both collapse to `Optional.empty()` — the caller
+doesn't need to distinguish those two failure reasons, the customer experience is identical
+either way.
+
+### `handleInputReply(session, current, rawInput)`
 
 ```java
 private EngineTurnResult handleInputReply(WorkflowSession session, WorkflowNode current, String rawInput) {
-    // Stub only - contract calls for a validation loop but no INPUT node exists in the
-    // seed flow to exercise it (build context doc section 3). Always accepts and advances.
     session.getContext().put(current.getNodeCode(), rawInput);
+    switch (current.getNodeCode()) {
+        case "CUSTOM_DATE_INPUT" -> session.getContext().put("reminder_date", rawInput);
+        case "CHURN_REASON_OTHER" -> session.getContext().put("reason", rawInput);
+        default -> {
+            // no downstream action reads this node's free text under a specific key
+        }
+    }
     logEvent(session, current, EventCode.AUTO, rawInputPayload(rawInput));
     WorkflowNode next = follow(current, EventCode.AUTO);
     return advanceAndFinalize(session, next);
 }
 ```
 
-**What it does**: stores whatever free text the customer typed into the session's `context` map,
-keyed by the current node's code, logs it as an `AUTO` event, and advances via the node's single
-`AUTO` transition (an `INPUT` node, by construction, only ever has one outgoing transition — there's
-nothing to branch on since there's no validation).
+Still a stub in the sense that there's no validation loop — whatever's typed is accepted and
+stored, always advancing via the node's single `AUTO` transition. Two things happen to the typed
+text: it's always stored under a generic key (`context[nodeCode] = rawInput`, useful for
+debugging/audit regardless of what the flow does with it), and — only for the specific `INPUT`
+nodes that currently exist in the seeded flow — also copied to the semantic key a downstream node
+actually reads (`reminder_date` for a custom date, `reason` for "other, please specify" churn
+reasons). `CUSTOM_DATE_INPUT` is currently unreachable in the live graph (the "choose another
+date" option was removed from `FUNDS_TIMING` per the latest script), but the `INPUT` node and this
+case are left in place rather than deleted, matching how a couple of dormant `ACTION`/`END` nodes
+elsewhere are deliberately kept as templates for future reuse.
 
-**Why it's a stub, and why that's flagged in a comment rather than fixed**: the seed flow (see
-`CODE_WALKTHROUGH.md` §8) has zero `INPUT`-typed nodes — every question in the AMB-shortfall flow
-is a multiple-choice `QUESTION`. There is currently nothing to validate free text *against* (no
-format rules, no "is this a valid amount" check), so writing a validation loop here would be
-building against a contract that has no real example to verify it against yet. The comment is
-there specifically so a future reader doesn't mistake "always accepts" for an oversight — it's
-recorded as a known, deliberate gap (also listed in `CODE_WALKTHROUGH.md` §11's scope-limits
-list).
-
-### `advanceAndFinalize(session, arrivalNode)` — line 115
+### `advanceAndFinalize(session, arrivalNode)`
 
 ```java
 private EngineTurnResult advanceAndFinalize(WorkflowSession session, WorkflowNode arrivalNode) {
@@ -336,7 +295,6 @@ private EngineTurnResult advanceAndFinalize(WorkflowSession session, WorkflowNod
             }
             case ACTION -> {
                 EventCode outcome = simulateAction(session, current);
-                steps.add(renderStep(current, session));
                 logEvent(session, current, outcome, null);
                 current = follow(current, outcome);
             }
@@ -354,6 +312,9 @@ private EngineTurnResult advanceAndFinalize(WorkflowSession session, WorkflowNod
             }
             case END -> {
                 steps.add(renderStep(current, session));
+                logEvent(session, current, EventCode.AUTO, null);
+                session.setConclusionCode(current.getConclusionCode());
+                session.setEntryReasonCode((String) session.getContext().get("entry_reason_code"));
                 session.setCurrentNodeId(current.getNodeId());
                 session.setStatus(SessionStatus.COMPLETED);
                 session.setEndedAt(Instant.now());
@@ -365,49 +326,42 @@ private EngineTurnResult advanceAndFinalize(WorkflowSession session, WorkflowNod
 }
 ```
 
-This is the engine's core loop, and it's the method `CODE_WALKTHROUGH.md` §1 points to as "walks
-a line" — everything else in the class exists to feed a starting node into this loop correctly.
+The engine's core loop — `CODE_WALKTHROUGH.md` §1 points to this as "walks a line." Per node
+type:
 
-**What it does, per node type**:
-- **`START`**: no message to render (it's a pure entry marker), just logs and immediately
-  advances via its single `AUTO` transition.
-- **`MESSAGE`**: renders its text, logs it, advances via `AUTO`. Never stops here.
-- **`ACTION`**: runs `simulateAction()` first to determine `SUCCESS` or `FAILURE`, *then* renders
-  the node's own message (its message is typically a "Generating your link..."-style line, shown
-  regardless of outcome), logs whichever outcome actually happened, and follows *that* outcome's
-  transition — meaning `ACTION` nodes can branch, unlike `START`/`MESSAGE`.
-- **`QUESTION`** / **`INPUT`**: render, move `currentNodeId` to this node, **save the session**,
-  and `return` — this is where the loop legitimately has to stop and wait for the caller to send
-  a `reply()`.
-- **`END`**: render, move `currentNodeId` here too, but additionally mark the session
-  `COMPLETED` and stamp `endedAt`, save, and `return`. Terminal — nothing ever transitions out of
-  an `END` node.
+- **`START`**: no message (pure entry marker), logs and advances via `AUTO`.
+- **`MESSAGE`**: renders, logs, advances via `AUTO`. Never stops here.
+- **`ACTION`**: runs `simulateAction()` to get `SUCCESS`/`FAILURE`, logs *that* outcome, follows
+  it. **Notice it does not call `renderStep()` at all** — an `ACTION` node's `message` column is
+  an internal description of the simulated call (e.g. "Calls the payment gateway to create a
+  secured funding link"), never customer-facing copy. Earlier this loop *did* render it, and that
+  internal description leaked straight into the live chat UI — a real bug, fixed by simply
+  dropping the `steps.add(...)` call for this case. `ACTION` steps still show up in a replayed
+  frame (§`CODE_WALKTHROUGH.md` §8), just with a null `message`, so the audit trail still explains
+  *why* a context value like `payment_link` appeared, without ever surfacing that text to a
+  customer.
+- **`QUESTION`/`INPUT`**: render, move `currentNodeId`, save, `return` — the two points where the
+  engine legitimately has to stop and wait for a `reply()`.
+- **`END`**: render, **log an `AUTO` event for itself** (the one node type where nothing else in
+  the code path logs an event on its behalf — `QUESTION`/`INPUT` get their event logged later,
+  when the *reply* comes in, but nothing ever comes in after an `END`). This was a real,
+  previously-undiscovered gap: without it, a session's very last message never appeared in
+  `workflow_session_event`, so every completed session's replayed frame was silently missing its
+  ending. Then it freezes two extra fields onto the session — `conclusionCode` (copied straight
+  from this node's static tag) and `entryReasonCode` (copied out of whatever's currently sitting
+  in `context["entry_reason_code"]`, which `applyNodeChoiceRule`'s `AMB_MENU` case wrote in
+  earlier — see below) — before marking `COMPLETED` and saving.
 
-**Why `START`/`MESSAGE`/`ACTION` don't return but `QUESTION`/`INPUT`/`END` do**: this *is* the
-engine's entire state machine, expressed as a single fact per node type — "does the engine need
-a human in the loop before it can keep going?" For `START`/`MESSAGE`/`ACTION` the answer is no
-(they're either automatic bookkeeping or a simulated system call with a deterministic-enough
-outcome), so the loop just keeps consuming nodes. For `QUESTION`/`INPUT`/`END` the answer is yes
-(a choice, free text, or "there's nothing more to do") — so those three, and only those three,
-are where the method can exit.
+**Why `START`/`MESSAGE`/`ACTION` don't return but `QUESTION`/`INPUT`/`END` do**: the entire state
+machine, expressed as one fact per node type — does the engine need a human in the loop before it
+can keep going? No for the first three (automatic bookkeeping or a simulated call with a
+deterministic-enough outcome); yes for the last three (a choice, free text, or "nothing more to
+do"). Only the session's *final* resting state after a whole multi-node walk gets written to the
+database — one `UPDATE`, not one per node, and if something threw partway through, the whole
+`@Transactional` call rolls back cleanly instead of leaving `currentNodeId` pointing at some
+intermediate node it should have already walked past.
 
-**Why the session is only saved inside the three `return` branches, not on every loop
-iteration**: an entire multi-node walk (`START` → `WELCOME` → `AGENDA` → `AMB_MENU`, say) happens
-in memory against one `WorkflowSession` object, and only the *final* resting state gets written
-to the database — one `UPDATE`, not four. This is both a performance choice (fewer round trips)
-and a correctness one: if something threw partway through the loop, the whole `@Transactional`
-call rolls back cleanly rather than leaving a session's `currentNodeId` pointing at some
-intermediate `MESSAGE` node it should have already walked past.
-
-**Why this is a `switch` over an enum rather than, say, polymorphic node subclasses** (a
-`WorkflowNode` base class with a `MESSAGE`/`QUESTION`/etc. subclass each implementing its own
-"handle" method): six node types, six fixed behaviors, all owned by the engine — there's no
-plugin/extensibility requirement calling for polymorphism here, and `WorkflowNode` is a plain JPA
-`@Entity` (Hibernate needs one concrete class to map to one table row, not a class hierarchy).
-The exhaustive `switch` over the `NodeType` enum gets the same "compiler tells you if you forget
-a case" safety a polymorphic dispatch would, with far less machinery.
-
-### `renderStep(node, session)` — line 163
+### `renderStep(node, session)`
 
 ```java
 private RenderedStep renderStep(WorkflowNode node, WorkflowSession session) {
@@ -416,46 +370,80 @@ private RenderedStep renderStep(WorkflowNode node, WorkflowSession session) {
 }
 ```
 
-A three-line helper, but it's called from five different places inside `advanceAndFinalize()`
-and once more in `handleQuestionReply()`'s invalid-reply path — pulling it out means "how do you
-turn a node into a `RenderedStep`" is defined exactly once, so if rendering logic ever needs to
-change (e.g. adding a "was this option list also included" field), there's a single call site to
-update.
+Called from four places in `advanceAndFinalize()` (`MESSAGE`/`QUESTION`/`INPUT`/`END` — not
+`ACTION`, per above) plus once more in `handleQuestionReply()`'s invalid-reply path. Pulled out so
+"how do you turn a node into a `RenderedStep`" is defined exactly once.
 
-### `applyRemindWhenRule(session, chosenOption)` — line 172
+### `applyNodeChoiceRule(session, node, transition)`
 
 ```java
-private void applyRemindWhenRule(WorkflowSession session, EventCode chosenOption) {
-    LocalDate reminderDate = switch (chosenOption) {
-        case OPTION_1 -> LocalDate.now(ZoneOffset.UTC).plusDays(3);
-        case OPTION_2 -> LocalDate.now(ZoneOffset.UTC).plusDays(7);
-        default -> throw new IllegalStateException("Unexpected REMIND_WHEN option " + chosenOption);
+private void applyNodeChoiceRule(WorkflowSession session, WorkflowNode node, WorkflowTransition transition) {
+    switch (node.getNodeCode()) {
+        case "AMB_MENU" -> session.getContext().put("entry_reason_code", transition.getEntryReasonCode());
+        case "FUNDS_TIMING" -> applyFundsTimingRule(session, transition.getOptionIndex());
+        case "CASH_FLOW_MENU" -> session.getContext().put("assistance_type", transition.getOptionLabel());
+        case "CHURN_REASON_MENU" -> {
+            if (transition.getOptionIndex() != null && transition.getOptionIndex() <= 4) {
+                session.getContext().put("reason", transition.getOptionLabel());
+            }
+        }
+        default -> {
+            // no business rule for this node's choice
+        }
+    }
+}
+```
+
+This replaced what used to be a single `if ("REMIND_WHEN".equals(...))` special case with a real
+(still tiny, still node-code-keyed, still explicitly *not* a generic rule engine) `switch` — the
+flow grew from one branch needing a business rule to four:
+
+- **`AMB_MENU`** — the newest case, added specifically to support session conclusions (§9 of
+  `CODE_WALKTHROUGH.md`). Every `AMB_MENU` option is tagged (in the seeder) with which top-level
+  path it represents; this just copies that tag into context the moment the choice is made, ready
+  to be frozen onto the session if/when it reaches an `END` node.
+- **`FUNDS_TIMING`** — delegates to `applyFundsTimingRule()` (below), the direct descendant of the
+  original `REMIND_WHEN` rule.
+- **`CASH_FLOW_MENU`** — records which assistance type was picked (its label, verbatim) into
+  context, read later by the `ROUTE_TO_EXECUTIVE` action's (simulated) request.
+- **`CHURN_REASON_MENU`** — records the churn reason, but *only* for options 1-4 (fixed labels);
+  option 5 ("Other, please specify") has no fixed label yet — the `CHURN_REASON_OTHER` `INPUT`
+  node fills in `reason` once the customer actually types it (see `handleInputReply()` above).
+
+Still exactly the scope call this project has made from the start: one small `switch`, not a
+generic "attach a rule to any node" mechanism, because there is a small, enumerable set of
+business rules and no requirement yet for an author to define new ones without a code change.
+
+### `applyFundsTimingRule(session, optionIndex)`
+
+```java
+private void applyFundsTimingRule(WorkflowSession session, Integer optionIndex) {
+    if (optionIndex == null) {
+        return;
+    }
+    LocalDate reminderDate = switch (optionIndex) {
+        case 1 -> LocalDate.now(ZoneOffset.UTC).plusDays(3);
+        case 2 -> LocalDate.now(ZoneOffset.UTC).plusDays(7);
+        case 3 -> LocalDate.now(ZoneOffset.UTC).plusDays(15);
+        default -> throw new IllegalStateException("Unexpected FUNDS_TIMING option " + optionIndex);
     };
     session.getContext().put("reminder_date", reminderDate.toString());
 }
 ```
 
-**What it does**: `REMIND_WHEN` offers exactly two choices ("In 3 days" / "Next week"); this
-turns whichever one was picked into an actual calendar date (`today + 3` or `today + 7`, computed
-in UTC) and writes it into `session.context["reminder_date"]` so the later `REMINDER_SET`
-message's `{{reminder_date}}` placeholder has something real to substitute.
+`FUNDS_TIMING` offers exactly three timed choices ("Within 3/7/15 days"); this turns whichever
+was picked into an actual calendar date, computed in UTC (deterministic regardless of server
+timezone/DST — same reasoning as pinning the JVM's default timezone at startup), written to
+`context["reminder_date"]` for `END_FUNDS_REMINDER`'s message to reference later. `default ->
+throw` rather than silently no-op-ing: this method is only reachable once `matchReply()` has
+already confirmed the index came from a real `OPTION` transition on this exact node, so hitting
+the default branch would mean the seed data itself grew a 4th `FUNDS_TIMING` option without this
+rule being updated — worth failing loudly on, not silently leaving `reminder_date` unset. (A 4th
+option, "choose another date" → a free-text `INPUT` node, existed at one point and was removed
+from the live graph per the latest script; this method's `default` case is exactly what would
+catch a future re-introduction of it without a matching engine update.)
 
-**Why `default -> throw`** rather than silently doing nothing for any other `EventCode`: this
-method is only ever called from the one call site in `handleQuestionReply()` that's already
-confirmed `current.getNodeCode().equals("REMIND_WHEN")` and that `chosenOption` matched one of
-this node's *actual* outgoing transitions — meaning, by construction, it can only legitimately be
-`OPTION_1` or `OPTION_2`, because those are the only two transitions the seed data gives that
-node. Hitting the `default` branch here would mean the seed data itself is inconsistent (a third
-option was added to `REMIND_WHEN` in the database without updating this rule) — a bug worth
-failing loudly on immediately, not silently ignoring and leaving `reminder_date` unset.
-
-**Why UTC specifically**: dates computed from the JVM's local timezone would shift by a day
-around midnight depending on server timezone/DST — using a fixed `ZoneOffset.UTC` makes "3 days
-from now" deterministic regardless of what machine or timezone the app happens to be deployed to
-(this is the same reasoning behind pinning the JVM's default timezone to UTC at startup, per
-`CODE_WALKTHROUGH.md` §3's note on `ChatBotServiceApplication`).
-
-### `simulateAction(session, node)` — line 186
+### `simulateAction(session, node)`
 
 ```java
 private EventCode simulateAction(WorkflowSession session, WorkflowNode node) {
@@ -469,230 +457,77 @@ private EventCode simulateAction(WorkflowSession session, WorkflowNode node) {
     }
 
     switch (node.getNodeCode()) {
-        case "GENERATE_LINK" ->
-                context.put("payment_link", "https://pay.hdfcbank.example/topup/" + session.getSessionId());
-        case "SET_REMINDER" -> context.put("reminder_id", "RMD-" + session.getSessionId());
+        case "GENERATE_FUND_LINK" -> context.put("payment_link",
+                "https://pay.hdfcbank.example/fund/" + session.getSessionId());
+        case "SCHEDULE_FUNDS_REMINDER" -> context.put("reminder_id", "RMD-" + session.getSessionId());
+        case "ROUTE_TO_EXECUTIVE" -> context.put("executive_handoff_id", "EXE-" + session.getSessionId());
+        case "CONVERT_SALARY_ACCOUNT" -> context.put("salary_conversion_id", "SAL-" + session.getSessionId());
+        case "LOG_CALLBACK_REQUEST" -> context.put("callback_request_id", "CB-" + session.getSessionId());
         default -> {
-            // no context side-effect needed (e.g. RECORD_OPT_OUT)
+            // no context side-effect needed (e.g. CHECK_FUNDING_STATUS)
         }
     }
     return config.getOnSuccessEvent();
 }
 ```
 
-**What it does**: there's no real payment gateway or CRM behind this POC, so every `ACTION` node
-"calls" is faked here. It loads the node's `WorkflowActionConfig` (which just holds which
-`EventCode` fires on success vs. failure for *this* node), then:
-1. If the session's context has `simulate_failure = true` set, consume that flag (remove it —
-   one-shot) and return the configured failure event.
-2. Otherwise, apply a hardcoded side effect keyed on the node's code — `GENERATE_LINK` writes a
-   fake `payment_link` URL built from the session id, `SET_REMINDER` writes a fake `reminder_id`
-   — and return the configured success event.
+There's no real payment gateway or CRM behind any of this. Five `ACTION` nodes now have a
+hardcoded side effect (up from the original two) as the flow grew branches: `GENERATE_FUND_LINK`
+writes the (fake) payment link that `FUND_TODAY_ACK`'s message goes on to reference via
+`{{payment_link}}`; the other four write a fake reference id into context, mirroring the same
+`"PREFIX-" + sessionId` pattern. `CHECK_FUNDING_STATUS` is one of a couple of `ACTION` nodes kept
+in the schema but currently unreachable from the live graph (a template for a future real
+24-hour-later recheck, which this engine — with no real async wait — can't model as a live graph
+edge in the same turn as an acknowledgment); it falls to `default`, no side effect.
 
-**Why `simulate_failure` is a context flag rather than, say, a fixed failure rate or an actual
-mocked external call**: this exists purely so a test (or a manual demo) can deterministically
-force the `FAILURE → AMB_MENU` loop-back paths (see `CODE_WALKTHROUGH.md`'s flow description —
-every action's failure branch loops back to the main menu) without needing a real backend or
-random/flaky test behavior. Consuming the flag after one use (rather than leaving it set) means a
-test can prove both halves of the story in one session: "the first attempt fails, and the retry
-after that succeeds" — see `WorkflowEngineTest.topUpFailureLoopsBackToMenuAndClearsFlagAfterOneUse`.
+`simulate_failure` is still a one-shot context flag, unrelated to any real reliability
+simulation: set it, the *next* `ACTION` node fails and the flag is consumed, so a retry
+immediately after succeeds. Exists purely so a test (or manual run) can deterministically exercise
+every `FAILURE → AMB_MENU` loop-back path without flaky random behavior.
 
-**Why the side effects are a `nodeCode`-keyed `switch` instead of being driven generically by
-`WorkflowActionConfig.requestTemplate`/`responseMapping`** (both of which exist as columns on
-that entity, per `CODE_WALKTHROUGH.md` §4, but aren't interpreted here): building a generic
-template-driven "simulate any HTTP call from a config row" interpreter is real infrastructure for
-a requirement — actually calling out to arbitrary backends — this project explicitly doesn't have
-yet. Three nodes, three hardcoded side effects (one of which is a no-op) is the entire
-requirement today; the config columns are left in the schema as the seam where that generic
-behavior would plug in later, without the engine speculatively building the interpreter now.
+### `rawInputPayload`, `toOptionViews`, `logEvent`, `loadNode`/`loadSession`, `outgoing`, `follow`, `generateSessionId`
 
-### `parseEventCode(rawInput)` — line 207
+Unchanged in shape and reasoning from the original design — small, single-purpose helpers:
 
-```java
-private Optional<EventCode> parseEventCode(String rawInput) {
-    if (rawInput == null) {
-        return Optional.empty();
-    }
-    try {
-        return Optional.of(EventCode.valueOf(rawInput.trim().toUpperCase()));
-    } catch (IllegalArgumentException e) {
-        return Optional.empty();
-    }
-}
-```
-
-**What it does**: this is, quite literally, the only place in the entire codebase that does
-anything resembling "understanding" a customer's reply. It trims whitespace, upper-cases it, and
-tries an exact match against the `EventCode` enum (`AUTO`, `OPTION_1`, `YES`, etc.) via
-`Enum.valueOf()`. Any input that doesn't exactly match one of those names — "yes please", "1",
-"add money" — fails to parse and becomes `Optional.empty()`.
-
-**Why catch `IllegalArgumentException` from `valueOf()` instead of checking membership some other
-way** (e.g. iterating `EventCode.values()` and comparing): `Enum.valueOf(Class, String)` is the
-standard JDK mechanism for "string to enum, or fail" — reaching for it and catching its documented
-failure mode is more idiomatic and less code than hand-rolling a lookup, and there's no
-performance concern at this scale to justify avoiding the exception path.
-
-**Why `Optional<EventCode>` as the return type instead of returning `null` or throwing**: this
-method's *caller* (`handleQuestionReply()`) needs to distinguish "couldn't parse anything
-recognizable" from "parsed fine, just isn't one of this particular node's options" — chaining
-`Optional.flatMap()` (as shown in `handleQuestionReply()` above) expresses "if this succeeded,
-then also try this" as one readable line, which a `null` check or an exception would make
-noisier. This is exactly why "reply matching is exact-string-to-EventCode only, no NLU" (per
-`CODE_WALKTHROUGH.md` §1) is such a clean, small method — there is genuinely no natural language
-understanding here, just an enum parse with a safety net.
-
-### `rawInputPayload(rawInput)` — line 218
-
-```java
-private Map<String, Object> rawInputPayload(String rawInput) {
-    Map<String, Object> payload = new LinkedHashMap<>();
-    payload.put("rawInput", rawInput);
-    return payload;
-}
-```
-
-A one-line wrapper, used only to build the `payload` argument for `logEvent()` calls that came
-from a customer reply (as opposed to `AUTO`/action-outcome events, which pass `null` for
-payload). Its entire job is giving the raw text a named key (`"rawInput"`) inside the
-`WorkflowSessionEvent.payload` jsonb column, so a later reader of the audit log (see
-`CODE_WALKTHROUGH.md` §4's `WorkflowSessionEvent` section) can tell *what the customer actually
-typed*, not just which `EventCode` it resolved to — useful specifically for diagnosing
-`INVALID_INPUT` events, where knowing the exact garbage input is the point.
-
-### `toOptionViews(transitions)` — line 224
-
-```java
-private List<OptionView> toOptionViews(List<WorkflowTransition> transitions) {
-    return transitions.stream().map(t -> new OptionView(t.getEventCode(), t.getOptionLabel())).toList();
-}
-```
-
-A straight mapping from the persistence-layer `WorkflowTransition` entities to the engine's own
-public `OptionView` DTO. Small, but it's the boundary that keeps `EngineTurnResult` (and
-everything downstream of it) from ever holding a reference to a JPA entity — callers of the
-engine get plain, detached data, not lazily-loaded Hibernate proxies that would break once the
-transaction/session closes.
-
-### `logEvent(session, node, eventCode, payload)` — line 228
-
-```java
-private void logEvent(WorkflowSession session, WorkflowNode node, EventCode eventCode, Map<String, Object> payload) {
-    workflowSessionEventRepository.save(WorkflowSessionEvent.builder()
-            .sessionId(session.getSessionId())
-            .nodeId(node.getNodeId())
-            .eventCode(eventCode)
-            .payload(payload)
-            .createdAt(Instant.now())
-            .build());
-}
-```
-
-Writes one row to the append-only `workflow_session_event` audit table (`CODE_WALKTHROUGH.md`
-§4) every time the engine visits a node or resolves an event — including automatic ones like
-`AUTO` and action outcomes, not just customer replies. It's called from nearly every branch of
-`advanceAndFinalize()` and both `handle*Reply()` methods, which is intentional: the audit trail
-is meant to be a complete record of everything the engine did during a turn, not just the parts a
-human explicitly triggered.
-
-### `loadNode(nodeId)` / `loadSession(sessionId)` — lines 238, 243
-
-```java
-private WorkflowNode loadNode(Long nodeId) {
-    return workflowNodeRepository.findById(nodeId)
-            .orElseThrow(() -> new IllegalStateException("Node " + nodeId + " not found"));
-}
-
-private WorkflowSession loadSession(String sessionId) {
-    return workflowSessionRepository.findById(sessionId)
-            .orElseThrow(() -> new IllegalArgumentException("Unknown session " + sessionId));
-}
-```
-
-Both are thin wrappers around `findById(...).orElseThrow(...)`, but notice they throw
-**different** exception types on purpose: `loadSession()` throws `IllegalArgumentException`
-because an unknown `sessionId` is a caller-supplied identifier that might legitimately not exist
-(typo, expired session, stale link) — a 404-shaped problem. `loadNode()` throws
-`IllegalStateException` because a `nodeId` reaching this method is *never* caller-supplied — it
-always comes from data already inside the database (a session's `currentNodeId`, a transition's
-`toNodeId`, an entry point's `startNodeId`). If one of those doesn't resolve to a real node, the
-seed/migration data itself is broken, which is an internal invariant violation, not a bad
-request — hence the different exception, and hence why the REST layer maps it to `409 Conflict`
-rather than `404 Not Found`.
-
-### `outgoing(nodeId)` — line 248
-
-```java
-private List<WorkflowTransition> outgoing(Long nodeId) {
-    return workflowTransitionRepository.findByFromNodeIdOrderByDisplayOrderAsc(nodeId);
-}
-```
-
-One-line delegate to the repository's derived query method. Kept as a private method (rather than
-calling the repository directly at each of its four call sites) purely for readability —
-`outgoing(current.getNodeId())` reads as intent ("this node's possible next steps") in a way that
-the raw repository method name doesn't quite.
-
-### `follow(node, eventCode)` — line 252
-
-```java
-private WorkflowNode follow(WorkflowNode node, EventCode eventCode) {
-    WorkflowTransition transition = outgoing(node.getNodeId()).stream()
-            .filter(t -> t.getEventCode() == eventCode)
-            .findFirst()
-            .orElseThrow(() -> new IllegalStateException(
-                    "No " + eventCode + " transition from " + node.getNodeCode()));
-    return loadNode(transition.getToNodeId());
-}
-```
-
-**What it does**: the single "take one hop" primitive everything else in the class builds on —
-load a node's outgoing transitions, find the one matching a specific event code, load and return
-its target. Every automatic advance inside `advanceAndFinalize()` (`START`→`AUTO`,
-`MESSAGE`→`AUTO`, `ACTION`→`SUCCESS`/`FAILURE`) and both reply handlers' post-match advances
-funnel through this one method.
-
-**Why it throws rather than returning `Optional<WorkflowNode>`**: unlike `parseEventCode()`
-(where "no match" is an expected, handleable customer-input case), a missing transition here
-means the *seed data* is incomplete — e.g. an `ACTION` node configured with a `FAILURE` event
-but no `FAILURE`-typed transition row wired up for it. That should never happen with correctly
-seeded data, and if it does, the right behavior is failing loudly the moment it's discovered, not
-propagating an empty `Optional` for some caller three frames up to eventually mishandle.
-
-### `generateSessionId()` — line 261
-
-```java
-private String generateSessionId() {
-    return "S" + UUID.randomUUID().toString().replace("-", "").substring(0, 10).toUpperCase();
-}
-```
-
-Builds an id like `S3F2A9B1C4` — a fixed `"S"` prefix (so session ids are visually
-distinguishable from node codes, entry codes, etc. at a glance in logs) followed by 10 hex
-characters taken from a random UUID with the dashes stripped out. Using only the first 10
-characters of a 32-character UUID trades a small amount of collision resistance for a shorter,
-more manageable id (it fits the `session_id` column's `length = 50` easily and reads better in
-logs/URLs than a full 36-character UUID) — reasonable for this POC's scale, where the practical
-collision odds are negligible and there's no business requirement (like a globally unique
-cross-system id) that would demand the full UUID.
+- `rawInputPayload(rawInput)` wraps the customer's literal text into the `payload` jsonb column
+  under key `"rawInput"`, used only for reply-driven `logEvent()` calls (auto/action-outcome
+  events pass `null`).
+- `toOptionViews(transitions)` maps persistence-layer `WorkflowTransition` entities to the
+  engine's own `OptionView` DTO — the boundary that keeps `EngineTurnResult` from ever leaking a
+  JPA entity/lazy proxy to a caller.
+- `logEvent(...)` writes one `workflow_session_event` row per node hop/event, called from nearly
+  every branch — the audit trail is meant to be complete, not just the parts a human explicitly
+  triggered. (See `CODE_WALKTHROUGH.md` §8/§9 for what now reads this log back.)
+- `loadNode()` throws `IllegalStateException` (a `nodeId` reaching it is never caller-supplied —
+  it always comes from data already in the DB; a miss means the seed data itself is broken).
+  `loadSession()` throws `IllegalArgumentException` (a caller-supplied `sessionId` might
+  legitimately not exist — typo, stale link). Different exceptions on purpose, mapped to
+  different HTTP statuses by `GlobalExceptionHandler` (`409` vs. `404`).
+- `outgoing(nodeId)` / `follow(node, eventCode)` are the one-hop primitives everything else is
+  built from — `follow()` throws rather than returning `Optional` for the same "seed data must be
+  internally consistent" reasoning as `loadNode()`.
+- `generateSessionId()` — `"S" + 10 hex chars from a random UUID` — unchanged.
 
 ---
 
 ## 4. How it all connects — one call traced end to end
 
-To tie the method-by-method breakdown together, here's what actually happens on a single
-`reply(sessionId, "OPTION_1")` call against a session sitting at `AMB_MENU`:
+`reply(sessionId, "5")` against a session sitting at `AMB_MENU`:
 
 1. `reply()` loads the session and the `AMB_MENU` node, stamps `lastInteractionAt`, sees
    `nodeType == QUESTION`, dispatches to `handleQuestionReply()`.
-2. `handleQuestionReply()` loads `AMB_MENU`'s three outgoing transitions via `outgoing()`, parses
-   `"OPTION_1"` via `parseEventCode()` → `EventCode.OPTION_1`, finds the matching transition
-   (→ `CONFIRM_TOPUP`). Not `REMIND_WHEN`, so no special rule. Logs the event via `logEvent()`,
-   loads `CONFIRM_TOPUP` via `loadNode()` (inside `follow`... actually here directly via
-   `loadNode(match.get().getToNodeId())`), and calls `advanceAndFinalize(session, CONFIRM_TOPUP)`.
-3. `advanceAndFinalize()` enters its loop at `CONFIRM_TOPUP`, sees it's a `QUESTION` node,
-   renders it via `renderStep()`, sets `currentNodeId`, saves the session, and returns — one
-   `RenderedStep`, the `CONFIRM_TOPUP` options, session still `ACTIVE`.
+2. `handleQuestionReply()` loads `AMB_MENU`'s 5 outgoing transitions via `outgoing()`. `"5"` isn't
+   `"YES"`/`"NO"`, so `matchReply()` parses it as `5` and finds the `OPTION` transition with
+   `optionIndex == 5` → "I no longer actively use this account" → `CHURN_ACK` (600).
+3. `applyNodeChoiceRule()` fires its `"AMB_MENU"` case: `context["entry_reason_code"] =
+   "CHURN_RISK"` (this transition's tag).
+4. The event is logged (`eventCode = OPTION`, `payload = {"rawInput": "5"}`), and
+   `advanceAndFinalize(session, CHURN_ACK)` runs.
+5. `advanceAndFinalize()` enters its loop at `CHURN_ACK` (`MESSAGE` — renders, logs, auto-advances)
+   → `CHURN_REASON_MENU` (`QUESTION` — renders, saves, returns). One `EngineTurnResult`: two
+   rendered steps, `CHURN_REASON_MENU`'s 5 options, session still `ACTIVE`.
 
-That's the whole engine: a handful of small, single-purpose methods, each throwing a specific
-exception type for a specific failure reason, composed into two public entry points.
+If the customer had instead eventually answered their way to an `END` node, step 5's loop would
+keep going past any further `MESSAGE`/`ACTION` nodes, hit the `END` case, log its own arrival
+event, freeze `conclusionCode`/`entryReasonCode` onto the session, and mark it `COMPLETED` — the
+last state a `GET /api/sessions/{id}/frame` call would later replay in full.

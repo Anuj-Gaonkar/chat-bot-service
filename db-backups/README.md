@@ -2,6 +2,30 @@
 
 Backups of the `chatbot` Postgres database (container `chat-bot-service-v2-postgres`, from `chat-bot-service/docker-compose.yml`), taken before making schema/data changes to the workflow tables.
 
+## Migrations
+
+`migrations/` holds every hand-run SQL change applied to the live dev DB *after* this backup was
+taken (`WorkflowSeeder` is idempotent and only seeds an empty DB, so any schema/data change to an
+already-seeded database needs its own SQL file here, applied directly via
+`docker exec -i chat-bot-service-v2-postgres psql -U chatbot -d chatbot < migrations/<file>.sql`).
+Applied in date order, each is self-documenting (a comment block at the top explains what changed
+and why) — as of this writing:
+
+1. `2026-08-06_amb_full_journey_rebuild.sql` — the generic `OPTION`+`option_index` transition
+   model, and the first 5-branch AMB shortfall journey (replacing an earlier 3-branch cut).
+2. `2026-08-06_amb_journey_fixes.sql` — post-rebuild fixes (duplicate-line acks, some
+   "remind me later" routing).
+3. `2026-08-10_amb_journey_v2_script_update.sql` — reworked the flow to match the bank's actual
+   WhatsApp script (updated copy, dropped/added options across every branch, the callback-button
+   pattern).
+4. `2026-08-11_session_conclusions.sql` — `conclusion_code` on `workflow_node`/`workflow_session`,
+   the `session_outcome` view.
+5. `2026-08-11_entry_reason_and_path.sql` — `entry_reason_code` on `workflow_transition`/
+   `workflow_session`, extends `session_outcome`.
+
+See `SINGLE-MODULE-CHATBOT-BUILD-CONTEXT.md` §2/§7.4 (one level up) for what these columns/views
+are actually for.
+
 ## 2026-08-06_12:52:56 backup
 
 Files:
