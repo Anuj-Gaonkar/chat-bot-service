@@ -56,6 +56,13 @@ public class WorkflowSession {
 	@Column(name = "conclusion_code", length = 50)
 	private String conclusionCode;
 
+	// Which top-level AMB_MENU option the customer picked (see WorkflowTransition.entryReasonCode),
+	// captured into context the moment they answer and frozen here alongside conclusionCode when
+	// the session completes. Distinguishes paths that converge on the same conclusionCode (e.g.
+	// "funds shortly" vs. "cash flow constraints -> remind me later" both end in REMINDER_SET).
+	@Column(name = "entry_reason_code", length = 50)
+	private String entryReasonCode;
+
 	@Column(name = "started_at", nullable = false)
 	private Instant startedAt;
 

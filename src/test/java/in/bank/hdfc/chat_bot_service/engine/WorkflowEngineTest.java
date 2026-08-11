@@ -56,6 +56,39 @@ class WorkflowEngineTest {
 
 		assertEquals("FUND_LINK_SENT", workflowSessionRepository.findById(started.sessionId())
 				.orElseThrow().getConclusionCode());
+		assertEquals("FUND_NOW", workflowSessionRepository.findById(started.sessionId())
+				.orElseThrow().getEntryReasonCode());
+	}
+
+	@Test
+	void divergentPathsToTheSameConclusionGetDifferentEntryReasons() {
+		// Both "I expect funds shortly" (direct) and "cash flow constraints" -> "remind me
+		// later" end up on END_FUNDS_REMINDER/REMINDER_SET - conclusionCode alone can't tell
+		// them apart. entryReasonCode should, since it's frozen from the *original* AMB_MENU
+		// choice, not the node they both happened to converge on.
+		EngineTurnResult shortly = engine.start("AMB_SHORTFALL_Q2", "CUST-ENTRY-SHORTLY", Map.of());
+		engine.reply(shortly.sessionId(), "2"); // "I expect funds shortly"
+		EngineTurnResult shortlyDone = engine.reply(shortly.sessionId(), "1"); // "Within 3 days"
+
+		EngineTurnResult cashflow = engine.start("AMB_SHORTFALL_Q2", "CUST-ENTRY-CASHFLOW", Map.of());
+		engine.reply(cashflow.sessionId(), "3"); // "I'm facing temporary cash flow constraints"
+		engine.reply(cashflow.sessionId(), "1"); // "Remind me later"
+		EngineTurnResult cashflowDone = engine.reply(cashflow.sessionId(), "1"); // "Within 3 days"
+
+		assertEquals("END_FUNDS_REMINDER", shortlyDone.currentNodeCode());
+		assertEquals("END_FUNDS_REMINDER", cashflowDone.currentNodeCode());
+
+		String shortlyConclusion = workflowSessionRepository.findById(shortly.sessionId())
+				.orElseThrow().getConclusionCode();
+		String cashflowConclusion = workflowSessionRepository.findById(cashflow.sessionId())
+				.orElseThrow().getConclusionCode();
+		assertEquals("REMINDER_SET", shortlyConclusion);
+		assertEquals("REMINDER_SET", cashflowConclusion, "same conclusion despite the different path");
+
+		assertEquals("FUNDS_SHORTLY", workflowSessionRepository.findById(shortly.sessionId())
+				.orElseThrow().getEntryReasonCode());
+		assertEquals("CASH_FLOW_CONSTRAINTS", workflowSessionRepository.findById(cashflow.sessionId())
+				.orElseThrow().getEntryReasonCode(), "entryReasonCode should distinguish what conclusionCode can't");
 	}
 
 	@Test
@@ -222,6 +255,8 @@ class WorkflowEngineTest {
 
 		assertEquals("CALLBACK_REQUESTED", workflowSessionRepository.findById(started.sessionId())
 				.orElseThrow().getConclusionCode());
+		assertEquals("CHURN_RISK", workflowSessionRepository.findById(started.sessionId())
+				.orElseThrow().getEntryReasonCode());
 	}
 
 	@Test

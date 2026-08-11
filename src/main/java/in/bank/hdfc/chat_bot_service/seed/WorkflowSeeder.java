@@ -290,7 +290,28 @@ public class WorkflowSeeder implements ApplicationRunner {
 		transitions.add(transition(638L, EventCode.SUCCESS, null, null, 639L, 1));
 		transitions.add(transition(638L, EventCode.FAILURE, null, null, 120L, 2));
 
+		tagEntryReasons(transitions);
 		workflowTransitionRepository.saveAll(transitions);
+	}
+
+	/**
+	 * Tags AMB_MENU's (node 120) 5 options with which top-level path they represent, later
+	 * frozen onto {@code WorkflowSession.entryReasonCode} the moment the choice is made - lets
+	 * two paths that converge on the same conclusion (e.g. "funds shortly" vs. "cash flow
+	 * constraints -> remind me later", both ending in REMINDER_SET) still be told apart.
+	 * Transitions have no assigned ID before {@code saveAll}, unlike nodes, so this matches by
+	 * (fromNodeId, optionIndex) instead of the id-keyed map {@link #tagConclusions} uses.
+	 */
+	private void tagEntryReasons(List<WorkflowTransition> transitions) {
+		Map<Integer, String> entryReasons = Map.of(
+				1, "FUND_NOW",
+				2, "FUNDS_SHORTLY",
+				3, "CASH_FLOW_CONSTRAINTS",
+				4, "UNAWARE_OF_REQUIREMENT",
+				5, "CHURN_RISK");
+		transitions.stream()
+				.filter(t -> t.getFromNodeId().equals(120L))
+				.forEach(t -> t.setEntryReasonCode(entryReasons.get(t.getOptionIndex())));
 	}
 
 	private WorkflowTransition transition(Long fromNodeId, EventCode eventCode, Integer optionIndex,

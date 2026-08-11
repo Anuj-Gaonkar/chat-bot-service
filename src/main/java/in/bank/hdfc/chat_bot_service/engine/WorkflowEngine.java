@@ -186,6 +186,10 @@ public class WorkflowEngine {
 					// Freeze this END node's conclusion tag onto the session - see
 					// WorkflowSession.conclusionCode.
 					session.setConclusionCode(current.getConclusionCode());
+					// Freeze whichever AMB_MENU option got them here (captured into context above,
+					// possibly overwritten by a later retry after a FAILURE loop) - see
+					// WorkflowSession.entryReasonCode.
+					session.setEntryReasonCode((String) session.getContext().get("entry_reason_code"));
 					session.setCurrentNodeId(current.getNodeId());
 					session.setStatus(SessionStatus.COMPLETED);
 					session.setEndedAt(Instant.now());
@@ -208,6 +212,7 @@ public class WorkflowEngine {
 	 */
 	private void applyNodeChoiceRule(WorkflowSession session, WorkflowNode node, WorkflowTransition transition) {
 		switch (node.getNodeCode()) {
+			case "AMB_MENU" -> session.getContext().put("entry_reason_code", transition.getEntryReasonCode());
 			case "FUNDS_TIMING" -> applyFundsTimingRule(session, transition.getOptionIndex());
 			case "CASH_FLOW_MENU" -> session.getContext().put("assistance_type", transition.getOptionLabel());
 			case "CHURN_REASON_MENU" -> {

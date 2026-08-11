@@ -15,6 +15,7 @@ import in.bank.hdfc.chat_bot_service.repository.WorkflowTransitionRepository;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -60,7 +61,23 @@ public class SessionFrameService {
 					.orElseThrow(() -> new IllegalStateException("Node " + event.getNodeId() + " not found"));
 			steps.add(buildStep(sequenceNo++, event, node, session.getContext()));
 		}
-		return SessionFrameResponse.from(session, steps);
+		return SessionFrameResponse.from(session, steps, pathSummary(steps));
+	}
+
+	/**
+	 * The full path as a readable breadcrumb - every option the customer actually chose, in
+	 * order, joined with " > ". Free to compute: {@link #optionsShownFor} already worked out
+	 * which option was {@code chosen} at each QUESTION step, this just collects them. Complements
+	 * {@code WorkflowSession.entryReasonCode}, which only captures the top-level AMB_MENU choice -
+	 * this shows the whole thing, including sub-branch choices like "Service concern" vs. "Other"
+	 * that entryReasonCode alone can't distinguish.
+	 */
+	private String pathSummary(List<FrameStepResponse> steps) {
+		return steps.stream()
+				.flatMap(s -> s.optionsShown().stream())
+				.filter(FrameOptionResponse::chosen)
+				.map(FrameOptionResponse::optionLabel)
+				.collect(Collectors.joining(" > "));
 	}
 
 	private FrameStepResponse buildStep(int sequenceNo, WorkflowSessionEvent event, WorkflowNode node,
