@@ -14,11 +14,13 @@ import java.util.Map;
  */
 public record SessionFrameResponse(String sessionId, String customerId, Long workflowVersionId,
 		SessionStatus status, Instant startedAt, Instant lastInteractionAt, Instant endedAt,
-		Map<String, Object> context, List<FrameStepResponse> steps, String pathSummary) {
+		Map<String, Object> context, List<FrameStepResponse> steps, String pathSummary,
+		String conclusionCode, String entryReasonCode) {
 
 	static SessionFrameResponse from(WorkflowSession session, List<FrameStepResponse> steps, String pathSummary) {
 		return new SessionFrameResponse(session.getSessionId(), session.getCustomerId(),
 				session.getWorkflowVersionId(), session.getStatus(), session.getStartedAt(),
-				session.getLastInteractionAt(), session.getEndedAt(), session.getContext(), steps, pathSummary);
+				session.getLastInteractionAt(), session.getEndedAt(), session.getContext(), steps, pathSummary,
+				session.getConclusionCode(), session.getEntryReasonCode());
 	}
 }
