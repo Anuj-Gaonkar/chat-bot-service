@@ -18,3 +18,13 @@ springdoc:
     path: /swagger-ui/index.html
   api-docs:
     path: /v3/api-docs
+
+# Meta WhatsApp Business Cloud API - see WHATSAPP_LAYER0_INTEGRATION_PLAN.md. All secrets come
+# from env vars, never hardcoded here. app-secret/access-token blank means "not configured yet" -
+# SignatureVerifier treats a blank app-secret as local/demo-only and skips verification.
+whatsapp:
+  api-version: v21.0
+  phone-number-id: ${WHATSAPP_PHONE_NUMBER_ID:}
+  access-token: ${WHATSAPP_ACCESS_TOKEN:}
+  verify-token: ${WHATSAPP_VERIFY_TOKEN:demo-verify-token}
+  app-secret: ${WHATSAPP_APP_SECRET:}

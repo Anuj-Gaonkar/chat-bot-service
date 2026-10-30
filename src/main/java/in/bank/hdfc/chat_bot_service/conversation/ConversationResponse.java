@@ -16,7 +16,7 @@ import java.util.stream.Collectors;
 public record ConversationResponse(String sessionId, SessionStatus status, String message,
 		Long currentNodeId, List<OptionResponse> options) {
 
-	static ConversationResponse from(EngineTurnResult result) {
+	public static ConversationResponse from(EngineTurnResult result) {
 		return new ConversationResponse(result.sessionId(), result.status(), combinedMessage(result.steps()),
 				result.currentNodeId(), result.options().stream().map(OptionResponse::from).toList());
 	}
