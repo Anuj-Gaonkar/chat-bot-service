@@ -100,7 +100,7 @@ public class WorkflowSeeder implements ApplicationRunner {
 		nodes.add(node(versionId, 200L, "GENERATE_FUND_LINK", NodeType.ACTION, "Generate fund link",
 				"Calls the payment gateway to create a secured funding link (simulated)", false, true, false));
 		nodes.add(node(versionId, 205L, "FUND_TODAY_ACK", NodeType.END, "Fund today ack",
-				"Thank you! Please fund your account by clicking on the below attached secured link. This will help you avoid AMB non-maintenance charges. {{payment_link}}",
+				"Thank you! Please fund your account by clicking on the below attached secured link. This will help you avoid AMB non-maintenance charges.",
 				false, false, false));
 		nodes.add(node(versionId, 210L, "CHECK_FUNDING_STATUS", NodeType.ACTION, "Check funding status",
 				"Rechecks whether the required AMB balance has been received (simulated 24-hour recheck)",

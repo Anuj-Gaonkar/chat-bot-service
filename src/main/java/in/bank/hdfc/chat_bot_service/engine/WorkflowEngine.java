@@ -260,8 +260,9 @@ public class WorkflowEngine {
 		}
 
 		switch (node.getNodeCode()) {
-			case "GENERATE_FUND_LINK" -> context.put("payment_link",
-					"https://pay.hdfcbank.example/fund/" + session.getSessionId());
+			case "GENERATE_FUND_LINK" -> {
+				// payment link generation temporarily disabled; no context value is set
+			}
 			case "SCHEDULE_FUNDS_REMINDER" -> context.put("reminder_id", "RMD-" + session.getSessionId());
 			case "ROUTE_TO_EXECUTIVE" -> context.put("executive_handoff_id", "EXE-" + session.getSessionId());
 			case "CONVERT_SALARY_ACCOUNT" -> context.put("salary_conversion_id", "SAL-" + session.getSessionId());
