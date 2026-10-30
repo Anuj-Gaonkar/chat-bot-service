@@ -1,5 +1,6 @@
 package in.bank.hdfc.chat_bot_service.web;
 
+import in.bank.hdfc.chat_bot_service.access.AccessDeniedException;
 import java.util.stream.Collectors;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -29,6 +30,13 @@ public class GlobalExceptionHandler {
 	@ResponseStatus(HttpStatus.CONFLICT)
 	public ApiError handleConflict(IllegalStateException e) {
 		return new ApiError("CONFLICT", e.getMessage());
+	}
+
+	// chat-ui link token didn't check out (unknown / expired / wrong phone number).
+	@ExceptionHandler(AccessDeniedException.class)
+	@ResponseStatus(HttpStatus.FORBIDDEN)
+	public ApiError handleAccessDenied(AccessDeniedException e) {
+		return new ApiError(e.getCode(), e.getMessage());
 	}
 
 	@ExceptionHandler(MethodArgumentNotValidException.class)
